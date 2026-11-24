@@ -25,6 +25,10 @@ import {
   Trees,
   Play,
   Save,
+  BedDouble,
+  Download,
+  Upload,
+  Share2,
   HelpCircle,
   Settings as SettingsIcon,
   Map as MapIcon,
@@ -981,17 +985,35 @@ function visibleStatuses(u) {
   return held.filter((st) => !hidden.has(st.type) && (STATUS_INFO[st.type] || {}).fx);
 }
 // --- Chance --------------------------------------------------------------
-// Every roll that decides something in the game goes through here. It is
-// Math.random by default; the suites replace it so they can assert on real
-// outcomes — that a unit with 100% crit chance actually crits — instead of only
-// on the shape of the code around the roll.
+// Every roll that decides something in the game goes through here. By default
+// it is a small seeded stream whose whole state is one integer, so a save
+// carries the dice with it: reload and the next blow lands exactly as it would
+// have, and a refresh is never a re-roll. The suites replace it so they can
+// assert on real outcomes — that a unit with 100% crit chance actually crits —
+// instead of only on the shape of the code around the roll.
 //
 // Identity generators (uids, animation ids) deliberately keep their own
 // Math.random: they decide nothing, and seeding them would only invite
 // collisions when a test pins the sequence.
-let RNG = Math.random;
+let RNG_SEED = (Math.random() * 4294967296) >>> 0;
+function seededRoll() {
+  // mulberry32: every 32-bit state is a fresh stream, and the state is all.
+  RNG_SEED = (RNG_SEED + 0x6d2b79f5) >>> 0;
+  let t = RNG_SEED;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+let RNG = seededRoll;
+// A function replaces the stream (the suites do this); a number puts the
+// seeded stream back exactly where a save left it; nothing restores it as is.
 function setRng(fn) {
-  RNG = fn || Math.random;
+  if (typeof fn === "number") RNG_SEED = fn >>> 0;
+  RNG = typeof fn === "function" ? fn : seededRoll;
+}
+// Where the seeded stream stands, for a save to carry.
+function rngSeed() {
+  return RNG_SEED;
 }
 function rng() {
   return RNG();
@@ -2397,7 +2419,87 @@ const NODE_RENAMES = {
   spiketrap: "grizzly",
 };
 const SPEC_RENAMES = { survivalist: "ranger" };
-const SAVE_VERSION = 6;
+const SAVE_VERSION = 7;
+// Where each save lives. The autosave is the game as it stands; the three Inn
+// pages are written only by the player; the anchor is the battle as it began,
+// which "Retry battle" goes back to. The checkpoint written before save 7 is
+// read once and played on from.
+const SAVE_KEYS = {
+  auto: "tactics:auto", "slot:1": "tactics:slot:1", "slot:2": "tactics:slot:2",
+  "slot:3": "tactics:slot:3", anchor: "tactics:anchor",
+};
+const INN_PAGES = ["slot:1", "slot:2", "slot:3"];
+const LEGACY_SAVE_KEY = "tactics:campaign";
+const BACKUP_FORMAT = "turneytactics.backup";
+// How long the board must sit still before the autosave writes: one action is
+// one write, however many renders it takes to land.
+const AUTOSAVE_MS = 300;
+// This page, among any others open on the same campaign.
+const TAB_ID = Math.random().toString(36).slice(2);
+// A save is the game as JSON, less two things JSON cannot carry. An item's
+// inlined icon is most of the weight of any board -- forty-odd items at two
+// thousand characters apiece -- and is the same on every copy of that item, so
+// it is left out and taken back from ITEMS on load. Infinity, which an aura's
+// status holds, would come back as null, so it travels as a marker.
+const SAVE_INFINITY = "__Infinity__";
+function packSave(data) {
+  return JSON.stringify(data, (k, v) =>
+    (k === "art" && typeof v === "string" ? undefined : v === Infinity ? SAVE_INFINITY : v));
+}
+function unpackSave(text) {
+  return JSON.parse(text, (k, v) => {
+    if (v === SAVE_INFINITY) return Infinity;
+    // An item is anything worn or carried: it has a slot and a name. Starting
+    // kit was never instantiated and has no key, so the name finds it.
+    if (v && typeof v === "object" && !Array.isArray(v) && typeof v.slot === "string" && v.name && !v.art) {
+      const base = (v.key && ITEMS[v.key]) || Object.values(ITEMS).find((it) => it.name === v.name);
+      if (base && base.art) return { ...v, art: base.art };
+    }
+    return v;
+  });
+}
+// What a stored save holds, if it can be trusted: the snapshot; "newer" for one
+// written by a later build, which this build must neither load nor overwrite;
+// or null for anything else -- missing, damaged, or the old checkpoint shape.
+function readSave(text) {
+  if (!text) return null;
+  let data;
+  try {
+    data = unpackSave(text);
+  } catch (e) {
+    return null;
+  }
+  if (!data || typeof data !== "object" || typeof data.v !== "number") return null;
+  if (data.v > SAVE_VERSION) return "newer";
+  if (data.v < SAVE_VERSION || !data.fields || !Array.isArray(data.fields.units)) return null;
+  if (typeof data.fields.mapId !== "string" || !CAMPAIGN.includes(data.fields.mapId)) return null;
+  return data;
+}
+// What a save is called: the stage the company is fighting on, or, anywhere
+// off the field, the one it is about to play. A town is where the company
+// stands, not where it is going.
+function saveLabel(f) {
+  const onField = f.screen === null && !f.gameOver;
+  const live = onField && f.turn !== "deploy";
+  const stage = mapById(onField ? f.mapId : nextUnbeaten(f.cleared || []));
+  return {
+    title: stage.name,
+    detail: [live ? `Turn ${f.turnCount}` : null, `${f.gold}g`].filter(Boolean).join(" · "),
+  };
+}
+// What the game says when saving goes wrong, and the one thing it offers to do.
+const SAVE_NOTICES = {
+  blocked: { title: "Not saving", action: "Try again",
+    body: "This browser is refusing to store the game. You can play on, but progress is lost when the page closes." },
+  tab: { title: "Open in another tab", action: "Reload this tab",
+    body: "This campaign carried on in another tab. Saving is paused here so the two cannot overwrite each other." },
+  newer: { title: "Update available", action: "Refresh",
+    body: "This save was made by a newer version of the game. Refresh to load it." },
+  unreadable: { title: "Save unreadable", action: "Close",
+    body: "That save could not be read, so nothing was changed." },
+  badfile: { title: "Not a backup", action: "Close",
+    body: "That file is not a TurneyTactics backup, so nothing was changed." },
+};
 function migrateUnit(u, from) {
   if (!u) return u;
   const out = { ...u };
@@ -5990,6 +6092,34 @@ export default function TurneyTactics() {
   const [turn, setTurn] = useState("deploy");
   const [deployPick, setDeployPick] = useState(null);
   const [savedGame, setSavedGame] = useState(null);
+  // The save system's own state. Nothing is written until the stored game has
+  // been read (`hydrated`), so the fresh default board can never overwrite it.
+  const [hydrated, setHydrated] = useState(false);
+  // What each stored save is called, by key, so the book reads without
+  // unpacking a board.
+  const [saveHeads, setSaveHeads] = useState({});
+  // Why saving has stopped, if it has: "blocked" (the browser refuses), "tab"
+  // (another tab carried the campaign on), "newer" (a later build wrote it).
+  const [saveTrouble, setSaveTrouble] = useState(null);
+  const [notice, setNotice] = useState(null);
+  // Counts writes, so the corner icon lights again on each one.
+  const [saveFlash, setSaveFlash] = useState(0);
+  // A page about to be written over or loaded, waiting on a yes.
+  const [saveAsk, setSaveAsk] = useState(null);
+  // A backup file made and waiting to leave, or picked and waiting to land.
+  const [backupFile, setBackupFile] = useState(null);
+  const [backupIn, setBackupIn] = useState(null);
+  // Every load bumps this, so a running enemy phase is torn down and the
+  // loaded one starts in its place.
+  const [loadCount, setLoadCount] = useState(0);
+  // The latest render's saved state. The enemy phase saves from a closure
+  // made when the phase began, so it must read the board from here.
+  const saveRef = useRef(null);
+  // Where a loaded enemy phase stood: its order, the next foe, its ledger.
+  const resumePhase = useRef(null);
+  // Above zero while a cutscene runs or a blow is still landing.
+  const saveHold = useRef(0);
+  const importInput = useRef(null);
   const [resumeDismissed, setResumeDismissed] = useState(false);
   // Rolled once for a company and again after each field it wins. Held in state
   // and written to the save, so the offer is the same however often the tavern
@@ -6106,6 +6236,9 @@ export default function TurneyTactics() {
   function playScene(at, beats, lead, after) {
     const giveBack = stageCam.borrow(at ? tileOnScreen(at) : null);
     setSceneOn(true);
+    // Nothing is saved half way through a scene: the save before it plays it
+    // again, whole, and the save after it holds what it did.
+    saveHold.current += 1;
     let t;
     // A beat happens at the start of its own hold and the hold is the time the
     // player is given to take it in. Holding first and acting after meant a
@@ -6126,6 +6259,7 @@ export default function TurneyTactics() {
         wait || SCENE_BEAT * (i === 0 ? SCENE_OPEN : i === 1 ? SCENE_SETTLE : 1));
     });
     setTimeout(() => {
+      saveHold.current -= 1;
       giveBack();
       setSceneOn(false);
       if (after) after();
@@ -6353,65 +6487,173 @@ function addTileEffect(x, y, kind, delay) {
     });
   }
 
-  // Campaign checkpoints are written at the start of every battle. Storage
-  // failures are non-fatal: the game simply runs without persistence.
-  function saveCheckpoint(id, carried, sup, inv, coin, party, clearedOverride) {
-    try {
-      if (typeof window === "undefined" || !window.storage) return;
-      window.storage
-        .set(
-          "tactics:campaign",
-          JSON.stringify({
-            v: SAVE_VERSION, mapId: id, carried: carried || null, supplies: sup,
-            inventory: inv || [], gold: coin, roster: party, reserve,
-            cleared: clearedOverride || cleared,
-            claimed: bountiesClaimed, seen: bountiesSeen, towns: townsSeen,
-            tavernSalt,
-          })
-        )
-        .catch(() => {});
-    } catch (e) {
-      /* no persistence available */
+  // The one writer. The autosave, an Inn page and a battle's opening are the
+  // same snapshot under different keys. It reads the latest render through
+  // saveRef rather than its own closure, because the enemy phase calls it from
+  // a closure made when the phase began. Storage failing is never fatal: the
+  // game plays on, and the corner icon turns red to say so.
+  function saveCheckpoint(slot = "auto", extra) {
+    const live = saveRef.current;
+    if (!live || !live.hydrated || live.trouble === "tab" || live.trouble === "newer") return false;
+    if (typeof window === "undefined" || !window.storage) return false;
+    const f = Object.fromEntries(live.fields.map(([k, v]) => [k, v]));
+    Object.assign(f, (extra && extra.fields) || {});
+    if (slot === "auto") {
+      // A cutscene, or a blow rolled but not yet landed, would be saved half done.
+      if (saveHold.current > 0) return false;
+      // The enemy phase saves itself, between foes, with its place in the
+      // queue; anything written mid-phase without that place would lose it.
+      if (f.turn === "enemy" && !f.gameOver && !(extra && extra.phase)) return false;
     }
+    const data = {
+      v: SAVE_VERSION, at: Date.now(), tab: TAB_ID, label: saveLabel(f), fields: f,
+      refs: {
+        xpPool: xpPoolRef.current, summonSeq: summonSeq.current, hazardSeq: hazardSeq.current,
+        logSeq: logSeq.current, felledBy: felledBy.current, scenes: Object.keys(scenePlayed.current),
+      },
+      rng: rngSeed(),
+      phase: (extra && extra.phase) || null,
+    };
+    // While a field is still in deployment, the autosave is also its opening:
+    // "Retry battle" goes back to the field as the company was last placed.
+    const keys = slot === "auto" && f.turn === "deploy" && !f.gameOver ? ["auto", "anchor"] : [slot];
+    let text;
+    try {
+      text = packSave(data);
+    } catch (e) {
+      console.error("save could not be packed:", e);
+      return false;
+    }
+    keys.forEach((key) => {
+      let wrote;
+      try {
+        wrote = window.storage.set(SAVE_KEYS[key], text);
+      } catch (e) {
+        wrote = Promise.reject(e);
+      }
+      Promise.resolve(wrote)
+        .then(() => {
+          setSaveHeads((h) => ({ ...h, [key]: { label: data.label, at: data.at } }));
+          setSaveFlash((n) => n + 1);
+          setSaveTrouble((t) => (t === "blocked" ? null : t));
+        })
+        .catch(() => {
+          if (saveRef.current && saveRef.current.trouble !== "blocked") setNotice("blocked");
+          setSaveTrouble((t) => t || "blocked");
+        });
+    });
+    return true;
   }
+  // The checkpoint the game wrote before save 7. It is read once at boot,
+  // played on from, and then removed.
   function clearCheckpoint() {
     try {
       if (typeof window === "undefined" || !window.storage) return;
-      window.storage.delete("tactics:campaign").catch(() => {});
+      window.storage.delete(LEGACY_SAVE_KEY).catch(() => {});
     } catch (e) {
       /* no persistence available */
     }
   }
 
+  // Boot: read every save, then put back the game as it stood. Until this has
+  // run nothing is written, so the default board cannot overwrite a real one.
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const stored = {};
       try {
-        if (typeof window === "undefined" || !window.storage) return;
-        const res = await window.storage.get("tactics:campaign");
-        if (cancelled || !res || !res.value) return;
-        const data = JSON.parse(res.value);
-        // A save from before the v8 overhaul carries old node and spec ids,
-        // and one from before save 6 carries health and Defense the rows now
-        // supply; migrate every stored unit before anything trusts them.
-        // Only `carried` holds unit objects; `roster` and `reserve` are id
-        // lists and need no mapping.
-        if (data && data.carried)
-          data.carried = data.carried.map((u) => migrateUnit(u, data.v || 0));
-        // an unknown id from an older or reordered campaign is simply ignored
-        if (data && typeof data.mapId === "string" && CAMPAIGN.includes(data.mapId)) {
-          setSavedGame(data);
+        if (typeof window !== "undefined" && window.storage) {
+          for (const key of [...Object.keys(SAVE_KEYS), "legacy"]) {
+            const res = await window.storage.get(key === "legacy" ? LEGACY_SAVE_KEY : SAVE_KEYS[key]);
+            stored[key] = res && res.value;
+          }
         }
       } catch (e) {
-        /* no saved campaign */
+        /* storage unreadable: play on, and say so when a write fails */
       }
+      if (cancelled) return;
+      const heads = {};
+      Object.keys(SAVE_KEYS).forEach((key) => {
+        const snap = key === "auto" ? null : readSave(stored[key]);
+        if (snap && snap !== "newer") heads[key] = { label: snap.label, at: snap.at };
+      });
+      setSaveHeads(heads);
+      const auto = readSave(stored.auto);
+      if (auto === "newer") {
+        setSaveTrouble("newer");
+        setNotice("newer");
+      } else if (auto) {
+        resumeCampaign(auto, "Resumed where you left off.");
+      } else if (stored.legacy) {
+        try {
+          const data = JSON.parse(stored.legacy);
+          // A save from before the v8 overhaul carries old node and spec ids,
+          // and one from before save 6 carries health and Defense the rows now
+          // supply; migrate every stored unit before anything trusts them.
+          // Only `carried` holds unit objects; `roster` and `reserve` are id
+          // lists and need no mapping.
+          if (data && data.carried)
+            data.carried = data.carried.map((u) => migrateUnit(u, data.v || 0));
+          // an unknown id from an older or reordered campaign is simply ignored
+          if (data && typeof data.mapId === "string" && CAMPAIGN.includes(data.mapId)) {
+            setSavedGame(data);
+          }
+        } catch (e) {
+          /* no saved campaign */
+        }
+      } else if (INN_PAGES.some((k) => heads[k])) {
+        // The game as it stood is gone, but the Inn's book is not: open it.
+        setSettingsTab("saves");
+        setScreen("settings");
+      }
+      setHydrated(true);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  function resumeCampaign() {
+  // The one loader. A save 7 snapshot is the game as it stood, and every piece
+  // goes back. The checkpoint from before save 7 held only the campaign, so its
+  // battle begins again from deployment.
+  function resumeCampaign(snap, line) {
+    if (snap && snap.fields) {
+      const f = snap.fields;
+      const refs = snap.refs || {};
+      // Refs before state: the effects that fire on this commit read them.
+      endedRef.current = !!f.gameOver;
+      xpPoolRef.current = refs.xpPool || 0;
+      summonSeq.current = refs.summonSeq || 1;
+      hazardSeq.current = refs.hazardSeq || 0;
+      logSeq.current = refs.logSeq || 0;
+      felledBy.current = refs.felledBy || {};
+      scenePlayed.current = Object.fromEntries((refs.scenes || []).map((k) => [k, true]));
+      resumePhase.current = f.turn === "enemy" && !f.gameOver ? snap.phase : null;
+      if (typeof snap.rng === "number") setRng(snap.rng);
+      saveRef.current.fields.forEach(([k, , set]) => {
+        if (k in f) set(f[k]);
+      });
+      clearSelection();
+      setPeek(null);
+      setDetail(null);
+      setDeployPick(null);
+      setAnimEvents([]);
+      setFloatingTexts([]);
+      setProjectiles([]);
+      setTileEffects([]);
+      setSceneOn(false);
+      setBoardShake(false);
+      setBarSweep(null);
+      setConfirmEnd(false);
+      setConfirmEscape(false);
+      setConfirmRestart(false);
+      setSavedGame(null);
+      setResumeDismissed(true);
+      setCombatMessageRaw(!f.gameOver && f.screen === null ? line || null : null);
+      setLoadCount((n) => n + 1);
+      stageCam.reset();
+      return;
+    }
     if (!savedGame) return;
     setCleared(savedGame.cleared || []);
     setBountiesClaimed(savedGame.claimed || []);
@@ -6431,11 +6673,125 @@ function addTileEffect(x, y, kind, delay) {
     setResumeDismissed(true);
     // A resumed company has already been formed; take them straight to the field.
     setScreen(null);
+    // From here the autosave carries it.
+    clearCheckpoint();
   }
   function declineResume() {
     clearCheckpoint();
     setSavedGame(null);
     setResumeDismissed(true);
+  }
+  // A page of the Inn's book, or the battle's opening, put back over the game.
+  async function loadSave(key) {
+    setSaveAsk(null);
+    let snap = null;
+    try {
+      const res = await window.storage.get(SAVE_KEYS[key]);
+      snap = readSave(res && res.value);
+    } catch (e) {
+      snap = null;
+    }
+    if (!snap || snap === "newer") {
+      setNotice(snap === "newer" ? "newer" : "unreadable");
+      return;
+    }
+    resumeCampaign(snap, key === "anchor" ? "The battle begins again." : null);
+  }
+  function saveToPage(key) {
+    setSaveAsk(null);
+    saveCheckpoint(key);
+  }
+  // A backup is every save in one file, the way PocketDAW keeps a song:
+  // tagged with its format, written as a Blob, and handed to Share where the
+  // phone offers it, or to a plain download.
+  async function exportBackup() {
+    saveCheckpoint("auto");
+    const doc = { format: BACKUP_FORMAT, v: SAVE_VERSION, exported: Date.now(), saves: {} };
+    try {
+      for (const key of Object.keys(SAVE_KEYS)) {
+        const res = await window.storage.get(SAVE_KEYS[key]);
+        if (res && res.value) doc.saves[key] = JSON.parse(res.value);
+      }
+    } catch (e) {
+      setNotice("unreadable");
+      return;
+    }
+    const pages = INN_PAGES.filter((k) => doc.saves[k]).length;
+    const name = `turney-tactics-${new Date().toISOString().slice(0, 10)}.json`;
+    const blob = new window.Blob([JSON.stringify(doc)], { type: "application/json" });
+    const file = typeof window.File === "function" ? new window.File([blob], name, { type: blob.type }) : null;
+    const nav = window.navigator;
+    const canShare = !!(file && nav && nav.canShare && nav.canShare({ files: [file] }));
+    setBackupFile({
+      name, file, canShare, url: window.URL.createObjectURL(blob),
+      summary: `${doc.saves.auto ? `Autosave at ${doc.saves.auto.label.title}` : "No autosave"} · ${pages} Inn page${pages === 1 ? "" : "s"}`,
+    });
+  }
+  function closeBackup() {
+    if (backupFile) window.URL.revokeObjectURL(backupFile.url);
+    setBackupFile(null);
+  }
+  // A picked file is read, and every save in it checked, before anything is
+  // asked: a file that is not a backup changes nothing.
+  function pickBackup(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new window.FileReader();
+    reader.onload = () => {
+      let doc = null;
+      try {
+        doc = JSON.parse(String(reader.result));
+      } catch (err) {
+        doc = null;
+      }
+      const saves = {};
+      let newer = false;
+      if (doc && doc.format === BACKUP_FORMAT && doc.saves && typeof doc.saves === "object") {
+        Object.keys(SAVE_KEYS).forEach((key) => {
+          if (!doc.saves[key]) return;
+          const text = JSON.stringify(doc.saves[key]);
+          const snap = readSave(text);
+          if (snap === "newer") newer = true;
+          else if (snap) saves[key] = { text, snap };
+        });
+      }
+      if (newer) {
+        setNotice("newer");
+        return;
+      }
+      if (!Object.keys(saves).length) {
+        setNotice("badfile");
+        return;
+      }
+      const pages = INN_PAGES.filter((k) => saves[k]).length;
+      setBackupIn({
+        name: file.name, saves,
+        summary: `${saves.auto ? `Autosave at ${saves.auto.snap.label.title}` : "No autosave"} · ${pages} Inn page${pages === 1 ? "" : "s"}`,
+      });
+    };
+    reader.readAsText(file);
+  }
+  async function applyBackup() {
+    const { saves } = backupIn;
+    setBackupIn(null);
+    try {
+      for (const key of Object.keys(SAVE_KEYS)) {
+        if (saves[key]) await window.storage.set(SAVE_KEYS[key], saves[key].text);
+        else await window.storage.delete(SAVE_KEYS[key]);
+      }
+    } catch (e) {
+      setNotice("blocked");
+      return;
+    }
+    const heads = {};
+    Object.keys(saves).forEach((key) => {
+      if (key !== "auto") heads[key] = { label: saves[key].snap.label, at: saves[key].snap.at };
+    });
+    setSaveHeads(heads);
+    const newest = saves.auto
+      || INN_PAGES.map((k) => saves[k]).filter(Boolean).sort((p, q) => q.snap.at - p.snap.at)[0];
+    if (newest) resumeCampaign(newest.snap, "Backup loaded.");
   }
 
   useEffect(() => {
@@ -6462,11 +6818,17 @@ function addTileEffect(x, y, kind, delay) {
       timers.push(t);
     };
 
+    // A phase put back from a save picks up at the foe it stopped before, in
+    // the order and with the ledger it had; its opening tick has already run.
+    const resumed = resumePhase.current;
+    resumePhase.current = null;
     // Roster order, or the shield wall first when the tactical layer is on.
-    const enemyIds = activationOrder(current.filter((u) => u.team === "enemy" && u.alive));
-    let i = 0;
+    const enemyIds = resumed
+      ? resumed.order
+      : activationOrder(current.filter((u) => u.team === "enemy" && u.alive));
+    let i = resumed ? resumed.next : 0;
     // What the side has committed to so far this phase, threaded as the board is.
-    let ledger = {};
+    let ledger = resumed ? resumed.ledger || {} : {};
 
     const finishPhase = () => {
       if (endedRef.current) return;
@@ -6529,6 +6891,12 @@ function addTileEffect(x, y, kind, delay) {
     };
 
     const nextEnemy = () => {
+      // The autosave's one moment in this phase: between foes, never between a
+      // foe's walk and its blow, with the place in the queue written down.
+      saveCheckpoint("auto", {
+        fields: { units: current, hazards: hazardsRef.current },
+        phase: { order: enemyIds, next: i, ledger },
+      });
       if (!current.some((u) => u.team === "player" && u.alive)) return;
       if (!current.some((u) => u.team === "enemy" && u.alive)) {
         finishPhase();
@@ -6808,10 +7176,11 @@ function addTileEffect(x, y, kind, delay) {
       });
       later(nextEnemy, shown.length > 0 ? 760 : 400);
     };
-    openPhase();
+    if (resumed) later(nextEnemy, 400);
+    else openPhase();
     return () => timers.forEach(clearTimeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [turn]);
+  }, [turn, loadCount]);
 
   // Any death path — blade, spell, poison, a long fall — funnels through here.
   useEffect(() => {
@@ -6903,8 +7272,6 @@ function addTileEffect(x, y, kind, delay) {
         const nextCleared = cleared.includes(mapId) ? cleared : [...cleared, mapId];
         setCleared(nextCleared);
         setGameOver(battleNumber(mapId) < CAMPAIGN.length ? "cleared" : "win");
-        // Write the ground gained before the player closes the app on the
-        // victory screen, or the battle they just won waits for them again.
         // The field's own salvage. It was only ever written into the save, so
         // the satchel on screen disagreed with the satchel on disk until the
         // next reload; granting it here is what makes the pack list honest.
@@ -6912,11 +7279,8 @@ function addTileEffect(x, y, kind, delay) {
         // New faces drift into the tavern once a field is won.
         setTavernSalt(Math.floor(Math.random() * 1e6));
         addLoot({ [CONSUMABLES.potion.name]: 1 });
-        const nextId = CAMPAIGN[battleNumber(mapId)] || mapId;
-        // Post-reward figures, or resuming from here would quietly roll back
-        // the purse and the draught this victory just earned.
-        saveCheckpoint(nextId, null, { ...supplies, potion: potions + POTIONS_PER_VICTORY },
-          inventory, gold + purse, roster, nextCleared);
+        // Nothing is written here: the autosave takes the purse, the draught
+        // and the cleared field once they have landed.
       }
     }
   }, [units, gameOver, mapId, skirmish, turnCount]);
@@ -7169,14 +7533,23 @@ function addTileEffect(x, y, kind, delay) {
   // The town's six doors. Lifted out of the town screen so the Party &
   // Inventory sheet -- which is one of them -- can show the row too, instead
   // of dropping the player onto a screen with no way back but a button.
+  // The Inn keeps the save book. Seven doors sit in two rows, four over
+  // three, so the short names share the top row and the long ones get the
+  // wider doors below.
   const TOWN_DOORS = [
     ["tavern", "Tavern", Beer],
+    ["inn", "Inn", BedDouble],
+    ["academy", "Academy", GraduationCap],
+    ["gear", "Gear", Package],
     ["blacksmith", "Blacksmith", Hammer],
     ["apothecary", "Apothecary", FlaskConical],
     ["bounties", "Bounties", Skull],
-    ["academy", "Academy", GraduationCap],
-    ["gear", "Gear", Package],
   ];
+  // Two rows whatever the count: the top row takes the odd door, and each row
+  // shares twelve tracks evenly between its doors.
+  const DOOR_TOP = Math.ceil(TOWN_DOORS.length / 2);
+  const doorSpan = (i) =>
+    ({ 2: "col-span-6", 3: "col-span-4", 4: "col-span-3" })[i < DOOR_TOP ? DOOR_TOP : TOWN_DOORS.length - DOOR_TOP];
   function openGear(from) {
     setGearFrom(from);
     setScreen("gear");
@@ -7213,6 +7586,77 @@ function addTileEffect(x, y, kind, delay) {
     setPendingAbility(null);
   }
 
+  // A sheet opened over the game is not where the game is: a reload lands on
+  // the screen underneath it.
+  const restingScreen =
+    screen === null || screen === "muster" || screen === "map" || screen === "town" ? screen
+      : screen === "tree" && treeFrom === "muster" ? "muster"
+      : !gameOver ? null
+      : (screen === "gear" && gearFrom === "town") || (screen === "tree" && treeFrom === "town") ? "town"
+      : "map";
+  // Everything a save holds, one row per piece of state: [name, value, setter].
+  // Saving and loading both walk this table, so state that must survive a
+  // reload is one row here and nothing else. What is missing is missing on
+  // purpose -- the selection, a half-aimed skill, the camera, the cart -- so a
+  // reload lands on the last thing actually done.
+  const SAVE_FIELDS = [
+    ["mapId", mapId, setMapId], ["mapPos", mapPos, setMapPos], ["screen", restingScreen, setScreen],
+    ["units", units, setUnits], ["hazards", hazards, writeHazards],
+    ["turn", turn, setTurn], ["turnCount", turnCount, setTurnCount], ["gameOver", gameOver, setGameOver],
+    ["skirmish", skirmish, setSkirmish], ["startingParty", startingParty, setStartingParty],
+    ["roster", roster, setRoster], ["reserve", reserve, setReserve],
+    ["supplies", supplies, setSupplies], ["inventory", inventory, setInventory], ["gold", gold, setGold],
+    ["cleared", cleared, setCleared], ["bountiesClaimed", bountiesClaimed, setBountiesClaimed],
+    ["bountiesSeen", bountiesSeen, setBountiesSeen], ["townsSeen", townsSeen, setTownsSeen],
+    ["tavernSalt", tavernSalt, setTavernSalt], ["ironman", ironman, setIronman],
+    ["lootedIds", lootedIds, setLootedIds], ["battleLoot", battleLoot, setBattleLoot],
+    ["xpShare", xpShare, setXpShare], ["moveUndo", moveUndo, setMoveUndo],
+    ["combatLog", combatLog, setCombatLog], ["townTab", townTab, setTownTab],
+    ["phaseSpeed", phaseSpeed, setPhaseSpeed],
+  ];
+  saveRef.current = { fields: SAVE_FIELDS, hydrated, trouble: saveTrouble };
+
+  // The autosave: whenever anything in the table changes, once the board has
+  // been still for a moment. A cutscene ending counts as a change, so whatever
+  // it held back is written the moment it finishes.
+  useEffect(() => {
+    if (!hydrated) return undefined;
+    const t = setTimeout(() => saveCheckpoint("auto"), AUTOSAVE_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, sceneOn, ...SAVE_FIELDS.map((row) => row[1])]);
+
+  // Leaving the page is the last moment a page can count on, so the autosave
+  // is written then and there. Another tab writing the same campaign stops
+  // this one saving, so the two cannot overwrite each other by turns.
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const flush = () => saveCheckpoint("auto");
+    const onHide = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    const onStorage = (e) => {
+      if (!e.key || !e.key.endsWith(SAVE_KEYS.auto) || !e.newValue) return;
+      try {
+        if (JSON.parse(e.newValue).tab !== TAB_ID) {
+          setSaveTrouble("tab");
+          setNotice("tab");
+        }
+      } catch (err) {
+        /* not a save this game wrote */
+      }
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("storage", onStorage);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function startBattle(id, carried, sup, inv, coin, party, foes) {
     applyMap(id);
     const party2 = party && party.length ? party : roster;
@@ -7240,7 +7684,6 @@ function addTileEffect(x, y, kind, delay) {
     setTurn("deploy");
     setDeployPick(null);
     setTurnCount(1);
-    saveCheckpoint(id, carried, suppliesOf(sup), inv || [], coin !== undefined ? coin : gold, party2);
     clearSelection();
     setMoveUndo(null);
     setPeek(null);
@@ -8197,9 +8640,15 @@ function addTileEffect(x, y, kind, delay) {
           return u;
         })
       );
-      // Nothing is struck until he comes down on it.
-      if (ab.hop) setTimeout(commitBlast, HOP_LAND_MS);
-      else commitBlast();
+      // Nothing is struck until he comes down on it -- and nothing is saved
+      // between the roll and the landing either.
+      if (ab.hop) {
+        saveHold.current += 1;
+        setTimeout(() => {
+          saveHold.current -= 1;
+          commitBlast();
+        }, HOP_LAND_MS);
+      } else commitBlast();
       if (xpGain > 0) awardPool(xpGain, null);
       // Scorched Earth and Winter's Grip: the spell changes the ground it lands
       // on. Which hazard, and where it will hold, comes from the tables.
@@ -8655,6 +9104,58 @@ function addTileEffect(x, y, kind, delay) {
     gameOver === "skirmish" || gameOver === "escaped";
   const deployKeySet = turn === "deploy" ? new Set(getDeployTiles().map((t) => key(t.x, t.y))) : new Set();
   const showResume = !!savedGame && !resumeDismissed;
+  // The newest page of the Inn's book: where a fall goes back to.
+  const lastPage = INN_PAGES.filter((k) => saveHeads[k])
+    .sort((p, q) => saveHeads[q].at - saveHeads[p].at)[0] || null;
+  const fallBack = ironman ? null : lastPage || (saveHeads.anchor ? "anchor" : null);
+  const savedAt = (at) =>
+    new Date(at).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  // The book of saves: written in at the Inn, read from in Settings. One list,
+  // so the two places cannot disagree about what a page holds. Each page is
+  // named for the stage the company was about to play.
+  const SaveSlots = ({ mode }) => (
+    <div className="space-y-1.5">
+      <div className="text-xs uppercase tracking-wide text-slate-500">
+        {mode === "save" ? "The innkeeper's book" : "Inn saves"} — {INN_PAGES.length} pages
+      </div>
+      {ironman ? (
+        <div className="rpg-inset p-2 type-body text-slate-300">
+          Ironman: no book is kept. The autosave holds your place and nothing else.
+        </div>
+      ) : (
+        INN_PAGES.map((key) => {
+          const head = saveHeads[key];
+          const can = mode === "save" ? canChangeGear : !!head;
+          return (
+            <div key={key} className="flex items-center gap-2 rpg-inset p-1.5">
+              <div className="flex-1">
+                <div className="type-mid font-bold text-slate-100">{head ? head.label.title : "Empty page"}</div>
+                <div className="type-body text-slate-400">
+                  {head
+                    ? `${head.label.detail} · ${savedAt(head.at)}`
+                    : mode === "save" ? "Nothing written here yet" : "Saved only at an Inn"}
+                </div>
+              </div>
+              <button
+                disabled={!can}
+                onClick={() => (head ? setSaveAsk({ mode, key }) : saveToPage(key))}
+                className={`py-2 px-3 rpg-btn type-body font-bold ${
+                  can ? "bg124e89 hv0099db text-white" : "bg-slate-800 tc5a6988"
+                }`}
+              >
+                {mode === "save" ? "Save" : "Load"}
+              </button>
+            </div>
+          );
+        })
+      )}
+      {mode === "save" && !ironman && (
+        <div className="type-body text-slate-400 pt-1">
+          Rest here between battles. The autosave never writes in this book.
+        </div>
+      )}
+    </div>
+  );
 
   // One place decides a tile's highlight, so the bush layer can match it.
   // Whoever is in the air this moment. Their tile is left untinted, because a
@@ -9126,6 +9627,18 @@ function addTileEffect(x, y, kind, delay) {
         .z-80 { z-index: 80; }
         .z-85 { z-index: 85; }
         .z-90 { z-index: 90; }
+        /* The autosave icon: twelve pixels in the corner, clear of a notch. */
+        .save-flash {
+          position: fixed;
+          z-index: 100;
+          top: calc(env(safe-area-inset-top, 0px) + 4px);
+          right: calc(env(safe-area-inset-right, 0px) + 4px);
+          line-height: 0;
+          color: #63c74d;
+          pointer-events: none;
+          animation: tactics-save-flash 1100ms ease-out forwards;
+        }
+        .save-stuck { color: #e43b44; animation: none; pointer-events: auto; }
         /* Overlay heights. Named for their role, not a stale pixel value. */
         .sheet-short { max-height: 62dvh; }
         .sheet-mid   { max-height: 66dvh; }
@@ -9140,6 +9653,10 @@ function addTileEffect(x, y, kind, delay) {
         .tce43b44 { color: #e43b44; }
         .tcf6757a { color: #f6757a; }
         .tcfee761 { color: #fee761; }
+        @keyframes tactics-save-flash {
+          0%, 45% { opacity: 1; }
+          100% { opacity: 0; }
+        }
         @keyframes tactics-banner {
           0% { opacity: 0; transform: translateY(-6px); }
           100% { opacity: 1; transform: translateY(0); }
@@ -10853,15 +11370,15 @@ function addTileEffect(x, y, kind, delay) {
             </div>
             )}
             {gearFrom === "town" && (
-            <div className="relative z-10 grid grid-cols-3 gap-1.5 px-3 pt-2 max-w-sm mx-auto w-full">
-              {TOWN_DOORS.map(([id, label, DoorIcon]) => (
+            <div className="relative z-10 grid grid-cols-12 gap-1.5 px-3 pt-2 max-w-sm mx-auto w-full">
+              {TOWN_DOORS.map(([id, label, DoorIcon], i) => (
                 <button
                   key={id}
                   onClick={() => {
                     setCart([]);
                     if (id !== "gear") { setTownTab(id); setScreen("town"); }
                   }}
-                  className={`flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-body font-bold ${
+                  className={`flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-body font-bold ${doorSpan(i)} ${
                     id === "gear" ? "bgf77622 text-white" : "bg3a4466 hv5a6988 text-slate-200"
                   }`}
                 >
@@ -11527,10 +12044,10 @@ function addTileEffect(x, y, kind, delay) {
             </div>
 
             {/* tabs */}
-            {/* Six doors will not fit across a phone. Three to a row, two
-                rows, each button wide enough to read and to hit. */}
-            <div className="relative z-10 grid grid-cols-3 gap-1.5 px-3 pt-2 max-w-sm mx-auto w-full">
-              {TABS.map(([id, label, TabIcon, alert]) => (
+            {/* Seven doors will not fit across a phone. Two rows on twelve
+                tracks, each door wide enough to read and to hit. */}
+            <div className="relative z-10 grid grid-cols-12 gap-1.5 px-3 pt-2 max-w-sm mx-auto w-full">
+              {TABS.map(([id, label, TabIcon, alert], i) => (
                 <button
                   key={id}
                   onClick={() => {
@@ -11543,7 +12060,7 @@ function addTileEffect(x, y, kind, delay) {
                         setBountiesSeen(postedBounties(cleared, bountiesClaimed).map(([k]) => k));
                     }
                   }}
-                  className={`flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-body font-bold ${
+                  className={`flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-body font-bold ${doorSpan(i)} ${
                     townTab === id ? "bgf77622 text-white" : "bg3a4466 hv5a6988 text-slate-200"
                   } ${alert && townTab !== id ? "tactics-alert" : ""}`}
                 >
@@ -11562,6 +12079,7 @@ function addTileEffect(x, y, kind, delay) {
                   </div>
                 )}
 
+                {townTab === "inn" && <SaveSlots mode="save" />}
                 {townTab === "tavern" && (
                   <div className="space-y-1.5">
                     <div className="text-xs uppercase tracking-wide text-slate-500">
@@ -12160,11 +12678,12 @@ function addTileEffect(x, y, kind, delay) {
                 ["tutorial", "Tutorial", HelpCircle],
                 ["terrain", "Terrain", Trees],
                 ["game", "Game", SettingsIcon],
+                ["saves", "Saves", Save],
               ].map(([id, label, TabIcon]) => (
                 <button
                   key={id}
                   onClick={() => setSettingsTab(id)}
-                  className={`flex-1 flex items-center justify-center gap-1 py-2.5 rpg-btn type-fine font-bold ${
+                  className={`flex-1 flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-fine font-bold ${
                     settingsTab === id ? "bg-amber-700 text-white" : "bg3a4466 hv5a6988 text-slate-300"
                   }`}
                 >
@@ -12241,6 +12760,33 @@ function addTileEffect(x, y, kind, delay) {
               </div>
             )}
 
+            {settingsTab === "saves" && (
+              <div className="space-y-3">
+                <SaveSlots mode="load" />
+                <div className="space-y-1.5">
+                  <div className="text-xs uppercase tracking-wide text-slate-500">Backup</div>
+                  <div className="type-body text-slate-400">
+                    Saves live in this browser only. A backup file holds the autosave and every Inn page.
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={exportBackup}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-3 rpg-btn type-fine font-bold bgfeae34 hvfee761 text-slate-900"
+                    >
+                      <Download size={13} /> Export
+                    </button>
+                    <button
+                      onClick={() => importInput.current && importInput.current.click()}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-3 rpg-btn type-fine font-bold bg124e89 hv0099db text-white"
+                    >
+                      <Upload size={13} /> Import
+                    </button>
+                  </div>
+                  <input ref={importInput} type="file" accept=".json,application/json" className="hidden" onChange={pickBackup} />
+                </div>
+              </div>
+            )}
+
             {settingsTab === "game" && (
               <div className="space-y-2">
                 <div className="type-mid text-slate-400">
@@ -12294,8 +12840,119 @@ function addTileEffect(x, y, kind, delay) {
         </Modal>
       )}
 
+      {/* The autosave, lit for a moment each time it writes; red and still
+          while the browser refuses to keep the game. */}
+      {saveTrouble === "blocked" ? (
+        <button onClick={() => setNotice("blocked")} aria-label="Not saving" className="save-flash save-stuck">
+          <Save size={12} />
+        </button>
+      ) : saveFlash > 0 ? (
+        <div key={saveFlash} className="save-flash" aria-hidden="true">
+          <Save size={12} />
+        </div>
+      ) : null}
+
+      {/* Covers the default board while the stored game is read: a blink on a
+          phone, and the reason a refresh never flashes the muster first. */}
+      {!hydrated && (
+        <div className="fixed inset-0 flex flex-col items-center justify-center" style={{ zIndex: 95, background: "#1b1330" }}>
+          <div
+            className="absolute inset-0"
+            style={{ backgroundImage: `url(${SKY_IMAGE})`, backgroundSize: "cover", backgroundPosition: "center", opacity: 0.3 }}
+          />
+          <div className="relative rpg-title type-mid" style={{ color: "#fee761", textShadow: "2px 2px 0 #181425" }}>
+            TurneyTactics
+          </div>
+          <div className="relative type-mid text-slate-300 mt-4">Opening your campaign</div>
+        </div>
+      )}
+
+      {notice && SAVE_NOTICES[notice] && (
+        <Modal z="z-90" onClose={() => setNotice(null)}>
+          <div className="text-center">
+            <div className="rpg-title type-fine mb-2">{SAVE_NOTICES[notice].title}</div>
+            <p className="type-body text-slate-300 mb-3">{SAVE_NOTICES[notice].body}</p>
+            <button
+              onClick={() => {
+                const was = notice;
+                setNotice(null);
+                if (was === "tab" || was === "newer") window.location.reload();
+                if (was === "blocked") saveCheckpoint("auto");
+              }}
+              className="w-full bg124e89 hv0099db text-white font-bold text-base py-3 rpg-btn"
+            >
+              {SAVE_NOTICES[notice].action}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {saveAsk && saveHeads[saveAsk.key] && (
+        <Confirm
+          title={saveAsk.mode === "save"
+            ? `Write over ${saveHeads[saveAsk.key].label.title}?`
+            : `Load ${saveHeads[saveAsk.key].label.title}?`}
+          confirmLabel={saveAsk.mode === "save" ? "Overwrite" : "Load"}
+          cancelLabel={saveAsk.mode === "save" ? "Keep it" : "Keep playing"}
+          tone={saveAsk.mode === "save" ? "bga22633 hve43b44" : "bg124e89 hv0099db"}
+          onCancel={() => setSaveAsk(null)}
+          onConfirm={() => (saveAsk.mode === "save" ? saveToPage(saveAsk.key) : loadSave(saveAsk.key))}
+        />
+      )}
+
+      {backupFile && (
+        <Modal z="z-90" onClose={closeBackup}>
+          <div className="text-center rpg-title type-fine mb-2">Ready</div>
+          <div className="rpg-inset p-1.5 mb-2">
+            <div className="type-mid font-bold text-slate-100">{backupFile.name}</div>
+            <div className="type-body text-slate-400">{backupFile.summary}</div>
+          </div>
+          <div className="flex gap-2">
+            {backupFile.canShare && (
+              <button
+                onClick={() => window.navigator.share({ files: [backupFile.file], title: backupFile.name }).catch(() => {})}
+                className="flex-1 flex items-center justify-center gap-1.5 py-3 rpg-btn type-fine font-bold bgfeae34 hvfee761 text-slate-900"
+              >
+                <Share2 size={13} /> Share
+              </button>
+            )}
+            <a
+              href={backupFile.url}
+              download={backupFile.name}
+              className="flex-1 flex items-center justify-center gap-1.5 py-3 rpg-btn type-fine font-bold bg3a4466 hv5a6988 text-white"
+            >
+              <Download size={13} /> Save file
+            </a>
+          </div>
+          <p className="type-body text-slate-400 mt-2">
+            {backupFile.canShare
+              ? "Share sends it to Files, AirDrop or Messages."
+              : "If Save file only opens the file, open the game in the browser itself and export there."}
+          </p>
+        </Modal>
+      )}
+
+      {backupIn && (
+        <Modal z="z-90" onClose={() => setBackupIn(null)}>
+          <div className="text-center rpg-title type-fine mb-2">Import this backup?</div>
+          <div className="rpg-inset p-1.5 mb-2">
+            <div className="type-mid font-bold text-slate-100">{backupIn.name}</div>
+            <div className="type-body text-slate-400">{backupIn.summary}</div>
+          </div>
+          <p className="type-body text-slate-300 mb-3">Your current saves will be replaced.</p>
+          <div className="flex gap-2">
+            <button onClick={() => setBackupIn(null)} className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn">
+              Cancel
+            </button>
+            <button onClick={applyBackup} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
+              Import
+            </button>
+          </div>
+        </Modal>
+      )}
+
       {showResume && (
-        <Modal z="z-70" onClose={() => {}}>
+        <Modal z="z-90" onClose={() => {}}>
             <Save size={30} className="tc2ce8f5 mx-auto mb-2" />
             <h2 className="text-base rpg-title mb-1">Campaign in Progress</h2>
             <p className="text-xs text-slate-400 mb-4">
@@ -12304,7 +12961,7 @@ function addTileEffect(x, y, kind, delay) {
             </p>
             <div className="flex gap-2">
               <button
-                onClick={resumeCampaign}
+                onClick={() => resumeCampaign()}
                 className="flex-1 bg124e89 hv0099db text-white font-bold text-base py-3 rpg-btn"
               >
                 Continue
@@ -12391,12 +13048,37 @@ function addTileEffect(x, y, kind, delay) {
               </div>
             )}
             {gameOver === "lose" ? (
-              <button
-                onClick={resetGame}
-                className="w-full bgfeae34 hvfee761 text-slate-900 font-bold text-base py-3 px-5 rpg-btn"
-              >
-                Play Again
-              </button>
+              /* A fall goes back to the newest page of the Inn's book, or, with
+                 the book empty, to the start of this battle. Ironman keeps no
+                 book, so the campaign begins again. */
+              <div className="space-y-2">
+                {fallBack && (
+                  <>
+                    <div className="rpg-inset p-1.5 text-left">
+                      <div className="type-mid font-bold text-slate-100">{saveHeads[fallBack].label.title}</div>
+                      <div className="type-body text-slate-400">
+                        {fallBack === "anchor"
+                          ? "From the start of the battle"
+                          : `${saveHeads[fallBack].label.detail} · ${savedAt(saveHeads[fallBack].at)}`}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => loadSave(fallBack)}
+                      className="w-full bgfeae34 hvfee761 text-slate-900 font-bold text-base py-3 px-5 rpg-btn"
+                    >
+                      {fallBack === "anchor" ? "Retry battle" : "Load last save"}
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={resetGame}
+                  className={`w-full font-bold text-base py-3 px-5 rpg-btn ${
+                    fallBack ? "bg3a4466 hv5a6988 text-white" : "bgfeae34 hvfee761 text-slate-900"
+                  }`}
+                >
+                  {ironman ? "Play Again" : "Restart campaign"}
+                </button>
+              </div>
             ) : gameOver === "skirmish" ? (
               <button
                 onClick={() => {

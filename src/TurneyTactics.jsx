@@ -6120,7 +6120,17 @@ export default function TurneyTactics() {
   // Above zero while a cutscene runs or a blow is still landing.
   const saveHold = useRef(0);
   const importInput = useRef(null);
-  const [resumeDismissed, setResumeDismissed] = useState(false);
+  // The title opens on every launch, and again from the map's Title button.
+  const [titleOpen, setTitleOpen] = useState(true);
+  // The sheet the title has open over it: "load" (the book and a backup
+  // file), or "new" (New Game asking before it replaces a game).
+  const [titleAsk, setTitleAsk] = useState(null);
+  // Set by the player's first choice at the title. Until then the board
+  // under the title is the default one, and nothing may be written over the
+  // stored game.
+  const [ready, setReady] = useState(false);
+  // The stored autosave, read at boot and put back when Continue is pressed.
+  const [bootSave, setBootSave] = useState(null);
   // Rolled once for a company and again after each field it wins. Held in state
   // and written to the save, so the offer is the same however often the tavern
   // is reopened or a save reloaded, and different for the next company.
@@ -6494,7 +6504,7 @@ function addTileEffect(x, y, kind, delay) {
   // game plays on, and the corner icon turns red to say so.
   function saveCheckpoint(slot = "auto", extra) {
     const live = saveRef.current;
-    if (!live || !live.hydrated || live.trouble === "tab" || live.trouble === "newer") return false;
+    if (!live || !live.ready || live.trouble === "tab" || live.trouble === "newer") return false;
     if (typeof window === "undefined" || !window.storage) return false;
     const f = Object.fromEntries(live.fields.map(([k, v]) => [k, v]));
     Object.assign(f, (extra && extra.fields) || {});
@@ -6555,8 +6565,8 @@ function addTileEffect(x, y, kind, delay) {
     }
   }
 
-  // Boot: read every save, then put back the game as it stood. Until this has
-  // run nothing is written, so the default board cannot overwrite a real one.
+  // Boot: read every save and hold the game as it stood for Continue. Nothing
+  // is put back, and nothing written, until the player chooses at the title.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -6583,7 +6593,7 @@ function addTileEffect(x, y, kind, delay) {
         setSaveTrouble("newer");
         setNotice("newer");
       } else if (auto) {
-        resumeCampaign(auto, "Resumed where you left off.");
+        setBootSave(auto);
       } else if (stored.legacy) {
         try {
           const data = JSON.parse(stored.legacy);
@@ -6601,10 +6611,6 @@ function addTileEffect(x, y, kind, delay) {
         } catch (e) {
           /* no saved campaign */
         }
-      } else if (INN_PAGES.some((k) => heads[k])) {
-        // The game as it stood is gone, but the Inn's book is not: open it.
-        setSettingsTab("saves");
-        setScreen("settings");
       }
       setHydrated(true);
     })();
@@ -6647,8 +6653,7 @@ function addTileEffect(x, y, kind, delay) {
       setConfirmEnd(false);
       setConfirmEscape(false);
       setConfirmRestart(false);
-      setSavedGame(null);
-      setResumeDismissed(true);
+      leaveTitle();
       setCombatMessageRaw(!f.gameOver && f.screen === null ? line || null : null);
       setLoadCount((n) => n + 1);
       stageCam.reset();
@@ -6669,17 +6674,34 @@ function addTileEffect(x, y, kind, delay) {
       savedGame.supplies || { potion: savedGame.potions || 0 },
       savedGame.inventory || [], savedGame.gold, savedGame.roster
     );
-    setSavedGame(null);
-    setResumeDismissed(true);
+    leaveTitle();
     // A resumed company has already been formed; take them straight to the field.
     setScreen(null);
     // From here the autosave carries it.
     clearCheckpoint();
   }
-  function declineResume() {
-    clearCheckpoint();
+  // Whatever the player chose at the title, the game is theirs from here: the
+  // title closes and saving begins.
+  function leaveTitle() {
     setSavedGame(null);
-    setResumeDismissed(true);
+    setBootSave(null);
+    setTitleAsk(null);
+    setTitleOpen(false);
+    setReady(true);
+  }
+  // Continue: at boot, the stored game goes back on the board; opened from
+  // the map, the game is already there and the title only has to close.
+  function titleContinue() {
+    if (bootSave) resumeCampaign(bootSave, "Resumed where you left off.");
+    else if (savedGame) resumeCampaign();
+    else leaveTitle();
+  }
+  // New Game: a fresh company at the muster. The checkpoint from before
+  // save 7 goes with the old game; the Inn's book is kept.
+  function newGame() {
+    clearCheckpoint();
+    resetGame();
+    leaveTitle();
   }
   // A page of the Inn's book, or the battle's opening, put back over the game.
   async function loadSave(key) {
@@ -7614,17 +7636,18 @@ function addTileEffect(x, y, kind, delay) {
     ["combatLog", combatLog, setCombatLog], ["townTab", townTab, setTownTab],
     ["phaseSpeed", phaseSpeed, setPhaseSpeed],
   ];
-  saveRef.current = { fields: SAVE_FIELDS, hydrated, trouble: saveTrouble };
+  saveRef.current = { fields: SAVE_FIELDS, ready, trouble: saveTrouble };
 
   // The autosave: whenever anything in the table changes, once the board has
   // been still for a moment. A cutscene ending counts as a change, so whatever
-  // it held back is written the moment it finishes.
+  // it held back is written the moment it finishes. Nothing is written before
+  // the player has chosen at the title.
   useEffect(() => {
-    if (!hydrated) return undefined;
+    if (!ready) return undefined;
     const t = setTimeout(() => saveCheckpoint("auto"), AUTOSAVE_MS);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, sceneOn, ...SAVE_FIELDS.map((row) => row[1])]);
+  }, [ready, sceneOn, ...SAVE_FIELDS.map((row) => row[1])]);
 
   // Leaving the page is the last moment a page can count on, so the autosave
   // is written then and there. Another tab writing the same campaign stops
@@ -9103,7 +9126,14 @@ function addTileEffect(x, y, kind, delay) {
     turn === "deploy" || gameOver === "cleared" || gameOver === "win" ||
     gameOver === "skirmish" || gameOver === "escaped";
   const deployKeySet = turn === "deploy" ? new Set(getDeployTiles().map((t) => key(t.x, t.y))) : new Set();
-  const showResume = !!savedGame && !resumeDismissed;
+  // What the title's Continue goes back to, and the line under it: the stored
+  // game at boot, the checkpoint from before save 7, or the game on the board.
+  const canContinue = !!bootSave || !!savedGame || ready;
+  const continueLine = bootSave
+    ? bootSave.label
+    : savedGame
+      ? { title: mapById(savedGame.mapId).name, detail: `Battle ${battleNumber(savedGame.mapId)}` }
+      : ready ? saveLabel(Object.fromEntries(SAVE_FIELDS.map(([k, v]) => [k, v]))) : null;
   // The newest page of the Inn's book: where a fall goes back to.
   const lastPage = INN_PAGES.filter((k) => saveHeads[k])
     .sort((p, q) => saveHeads[q].at - saveHeads[p].at)[0] || null;
@@ -9582,6 +9612,7 @@ function addTileEffect(x, y, kind, delay) {
           --t-btn-xs: 12px;
           --t-btn-sm: 12.5px;
           --t-btn-base: 14px;
+          --t-title: 54px;  /* the game's name on the title screen            */
         }
         .type-fine { font-size: var(--t-fine); }
         .type-node { font-size: var(--t-node); }
@@ -9590,6 +9621,7 @@ function addTileEffect(x, y, kind, delay) {
         .type-large { font-size: var(--t-large); }
         .type-panel { font-size: var(--t-panel); }
         .type-huge { font-size: var(--t-huge); }
+        .type-title { font-size: var(--t-title); }
         /* Silkscreen keeps its own measure wherever it is a raised button
            label: the two-class selector outranks the plain one. */
         .rpg-btn.type-body { font-size: var(--t-btn); }
@@ -9639,6 +9671,16 @@ function addTileEffect(x, y, kind, delay) {
           animation: tactics-save-flash 1100ms ease-out forwards;
         }
         .save-stuck { color: #e43b44; animation: none; pointer-events: auto; }
+        /* The game's name on the title screen: the one place the button face
+           is not a button label, chosen so the name reads like the buttons. */
+        .title-name {
+          font-family: 'Silkscreen', monospace;
+          font-weight: 700;
+          line-height: 1.08;
+          letter-spacing: 0.02em;
+          color: #fee761;
+          text-shadow: 4px 4px 0 #181425;
+        }
         /* Overlay heights. Named for their role, not a stale pixel value. */
         .sheet-short { max-height: 62dvh; }
         .sheet-mid   { max-height: 66dvh; }
@@ -12530,6 +12572,12 @@ function addTileEffect(x, y, kind, delay) {
                   >
                     Back
                   </button>
+                  <button
+                    onClick={() => setTitleOpen(true)}
+                    className="bg3a4466 hv5a6988 text-white font-bold text-sm py-3 px-3 rpg-btn"
+                  >
+                    Title
+                  </button>
                   {canTravel && (
                     <button
                       onClick={() => openGear("map")}
@@ -12782,7 +12830,6 @@ function addTileEffect(x, y, kind, delay) {
                       <Upload size={13} /> Import
                     </button>
                   </div>
-                  <input ref={importInput} type="file" accept=".json,application/json" className="hidden" onChange={pickBackup} />
                 </div>
               </div>
             )}
@@ -12852,19 +12899,111 @@ function addTileEffect(x, y, kind, delay) {
         </div>
       ) : null}
 
-      {/* Covers the default board while the stored game is read: a blink on a
-          phone, and the reason a refresh never flashes the muster first. */}
-      {!hydrated && (
-        <div className="fixed inset-0 flex flex-col items-center justify-center" style={{ zIndex: 95, background: "#1b1330" }}>
-          <div
-            className="absolute inset-0"
-            style={{ backgroundImage: `url(${SKY_IMAGE})`, backgroundSize: "cover", backgroundPosition: "center", opacity: 0.3 }}
-          />
-          <div className="relative rpg-title type-mid" style={{ color: "#fee761", textShadow: "2px 2px 0 #181425" }}>
-            TurneyTactics
-          </div>
-          <div className="relative type-mid text-slate-300 mt-4">Opening your campaign</div>
+      {/* The one file picker, for Import in Settings and at the title. */}
+      <input ref={importInput} type="file" accept=".json,application/json" className="hidden" onChange={pickBackup} />
+
+      {/* The title: every launch opens here, and the map's Title button comes
+          back to it. At boot the board under it is the default one, which is
+          why nothing is saved until the player has chosen. Its buttons wait
+          for the stored game to be read: a blink on a phone. */}
+      {titleOpen && (
+        <div
+          className="fixed inset-0 flex flex-col items-center"
+          style={{
+            zIndex: 85, backgroundColor: "#181425", backgroundImage: `url(${SKY_IMAGE})`,
+            backgroundSize: "cover", backgroundPosition: "center top", backgroundRepeat: "no-repeat",
+          }}
+        >
+          <h1 className="title-name type-title text-center" style={{ marginTop: "14vh" }}>
+            <div>Turney</div>
+            <div>Tactics</div>
+          </h1>
+          {hydrated && (
+            <div className="w-full max-w-xs px-6 flex flex-col" style={{ marginTop: "8vh" }}>
+              {canContinue ? (
+                <>
+                  <button
+                    onClick={titleContinue}
+                    className="w-full font-bold py-4 rpg-btn type-large bgfeae34 hvfee761 text-slate-900"
+                  >
+                    Continue
+                  </button>
+                  <div
+                    className="type-mid text-center mt-2 mb-5"
+                    style={{ color: "#f4f4f8", textShadow: "1px 1px 0 #181425" }}
+                  >
+                    {continueLine && `${continueLine.title} · ${continueLine.detail}`}
+                  </div>
+                </>
+              ) : (
+                <button
+                  onClick={newGame}
+                  className="w-full font-bold py-4 rpg-btn type-large bgfeae34 hvfee761 text-slate-900 mb-4"
+                >
+                  New Game
+                </button>
+              )}
+              <button
+                onClick={() => setTitleAsk("load")}
+                className="w-full font-bold py-4 rpg-btn type-large bg124e89 hv0099db text-white mb-4"
+              >
+                Load Game
+              </button>
+              {canContinue && (
+                <button
+                  onClick={() => setTitleAsk("new")}
+                  className="w-full font-bold py-4 rpg-btn type-large bg3a4466 hv5a6988 text-white"
+                >
+                  New Game
+                </button>
+              )}
+            </div>
+          )}
         </div>
+      )}
+
+      {titleOpen && titleAsk === "load" && (
+        <Modal z="z-90" onClose={() => setTitleAsk(null)}>
+          <div className="text-center rpg-title type-fine mb-2">Load game</div>
+          <SaveSlots mode="load" />
+          <div className="space-y-1.5 mt-3">
+            <div className="text-xs uppercase tracking-wide text-slate-500">From a backup file</div>
+            <button
+              onClick={() => importInput.current && importInput.current.click()}
+              className="w-full flex items-center justify-center gap-1.5 py-3 rpg-btn type-fine font-bold bg124e89 hv0099db text-white"
+            >
+              <Upload size={13} /> Import
+            </button>
+          </div>
+          <button
+            onClick={() => setTitleAsk(null)}
+            className="w-full mt-3 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn"
+          >
+            Back
+          </button>
+        </Modal>
+      )}
+
+      {titleOpen && titleAsk === "new" && (
+        <Modal z="z-90" onClose={() => setTitleAsk(null)}>
+          <div className="text-center">
+            <div className="rpg-title type-fine mb-2">Start a new game?</div>
+            <p className="type-body text-slate-300 mb-3">
+              Your game in progress will be replaced. Inn saves are kept.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setTitleAsk(null)}
+                className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn"
+              >
+                Cancel
+              </button>
+              <button onClick={newGame} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
+                New game
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {notice && SAVE_NOTICES[notice] && (
@@ -12893,7 +13032,7 @@ function addTileEffect(x, y, kind, delay) {
             ? `Write over ${saveHeads[saveAsk.key].label.title}?`
             : `Load ${saveHeads[saveAsk.key].label.title}?`}
           confirmLabel={saveAsk.mode === "save" ? "Overwrite" : "Load"}
-          cancelLabel={saveAsk.mode === "save" ? "Keep it" : "Keep playing"}
+          cancelLabel={saveAsk.mode === "save" ? "Keep it" : "Cancel"}
           tone={saveAsk.mode === "save" ? "bga22633 hve43b44" : "bg124e89 hv0099db"}
           onCancel={() => setSaveAsk(null)}
           onConfirm={() => (saveAsk.mode === "save" ? saveToPage(saveAsk.key) : loadSave(saveAsk.key))}
@@ -12948,31 +13087,6 @@ function addTileEffect(x, y, kind, delay) {
               Import
             </button>
           </div>
-        </Modal>
-      )}
-
-      {showResume && (
-        <Modal z="z-90" onClose={() => {}}>
-            <Save size={30} className="tc2ce8f5 mx-auto mb-2" />
-            <h2 className="text-base rpg-title mb-1">Campaign in Progress</h2>
-            <p className="text-xs text-slate-400 mb-4">
-              You left off at Battle {battleNumber(savedGame.mapId)} — {mapById(savedGame.mapId).name}. Your party keeps its levels,
-              gear and wounds.
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => resumeCampaign()}
-                className="flex-1 bg124e89 hv0099db text-white font-bold text-base py-3 rpg-btn"
-              >
-                Continue
-              </button>
-              <button
-                onClick={declineResume}
-                className="bg3a4466 hv5a6988 text-slate-200 font-bold text-base py-3 px-4 rpg-btn"
-              >
-                New Run
-              </button>
-            </div>
         </Modal>
       )}
 

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
+  Keyboard,
   Shield,
   Sword,
   Trophy,
@@ -5800,9 +5801,14 @@ function Modal({ z, width = "max-w-xs", inset = "px-6", tall, scene, onClose, ch
           }}
         />
       )}
-      <div className={`absolute inset-0 bg-black ${scene ? "opacity-60" : "opacity-80"}`} onClick={onClose} />
       <div
-        className={`relative rounded-xl p-3 w-full ${width} tactics-panel${tall ? ` ${tall} overflow-y-auto` : ""}`}
+        className={`absolute inset-0 bg-black ${scene ? "opacity-60" : "opacity-80"}`}
+        onClick={onClose}
+        data-hotkey={onClose ? "Esc" : undefined}
+        data-quiet
+      />
+      <div
+        className={`relative rounded-xl p-3 w-full ${width} tactics-panel ui-zoom${tall ? ` ${tall} overflow-y-auto` : ""}`}
         onClick={(e) => e.stopPropagation()}
       >
         {children}
@@ -5818,10 +5824,10 @@ function Confirm({ z = "z-90", title, confirmLabel = "Yes", cancelLabel = "No", 
       <div className="text-center">
         <div className="rpg-title type-fine mb-3">{title}</div>
         <div className="flex gap-2">
-          <button onClick={onCancel} className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn">
+          <button data-hotkey="Esc" onClick={onCancel} className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn">
             {cancelLabel}
           </button>
-          <button onClick={onConfirm} className={`flex-1 ${tone} text-white text-base font-bold py-3 rpg-btn`}>
+          <button data-hotkey="Enter" onClick={onConfirm} className={`flex-1 ${tone} text-white text-base font-bold py-3 rpg-btn`}>
             {confirmLabel}
           </button>
         </div>
@@ -5829,6 +5835,112 @@ function Confirm({ z = "z-90", title, confirmLabel = "Yes", cancelLabel = "No", 
     </Modal>
   );
 }
+
+// How the game is being played. A page cannot be told "this is a phone" or
+// "this is a desktop": browsers report no device kind that can be trusted (an
+// iPad calls itself a Mac). Three things can be known, and each drives one
+// part of the game. Room decides the layout. A mouse as the main pointer
+// decides hover, "Click" and the right-click. A keyboard cannot be detected
+// until a key is pressed, so key caps show where a mouse is the main pointer
+// and from the first key press anywhere else. Keys themselves always work.
+// The player can override the guess in Settings: "auto", "touch" or "keys".
+const ROOM = { w: 900, h: 600 };
+const FINE_POINTER = "(hover: hover) and (pointer: fine)";
+const CONTROLS_KEY = "tactics:controls";
+const CONTROL_MODES = [["auto", "Auto"], ["touch", "Touch"], ["keys", "Keys & mouse"]];
+function inputMode(env, pref, typed) {
+  const mouse = pref === "keys" || (pref === "auto" && env.mouse);
+  const wide = env.w >= ROOM.w && env.h >= ROOM.h;
+  const desk = wide && mouse;
+  // One scale for every panel: 1.3 on a 1440x900 window, 1.5 on 1920x1080.
+  const ui = desk ? Math.round(Math.min(1.5, Math.max(1, Math.min(env.w / 1100, env.h / 690))) * 20) / 20 : 1;
+  return {
+    wide, mouse, desk, ui,
+    caps: pref !== "touch" && (mouse || typed),
+    // The board opens fitted to the window: 1.5x at 900 tall, 1.8x at 1080.
+    fit: desk ? Math.min(2.2, Math.max(1, Math.min(env.w / 960, env.h / 600))) : 1,
+    // The bottom-right panel needs room beside End Turn; without it, it sits
+    // above the row instead.
+    stack: desk && env.w < 1080 * ui,
+    // The Controls row is offered where the guess could be wrong: with room
+    // or a mouse. A phone has neither, so its Settings are unchanged.
+    offer: wide || env.mouse,
+  };
+}
+function useInput(pref) {
+  const read = () => (typeof window === "undefined" ? { w: 390, h: 844, mouse: false }
+    : { w: window.innerWidth, h: window.innerHeight, mouse: window.matchMedia(FINE_POINTER).matches });
+  const [env, setEnv] = useState(read);
+  const [typed, setTyped] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const mq = window.matchMedia(FINE_POINTER);
+    const reread = () => setEnv(read());
+    const typedOnce = () => setTyped(true);
+    window.addEventListener("resize", reread);
+    if (mq.addEventListener) mq.addEventListener("change", reread);
+    window.addEventListener("keydown", typedOnce, { once: true });
+    return () => {
+      window.removeEventListener("resize", reread);
+      if (mq.removeEventListener) mq.removeEventListener("change", reread);
+      window.removeEventListener("keydown", typedOnce);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return inputMode(env, pref, typed);
+}
+
+// Keys. A button names its key with `data-hotkey`, and one listener presses
+// whichever button on the top layer carries the key that was pressed: a key
+// always does exactly what its button does, and the printed cap is drawn from
+// the same attribute, so the two cannot disagree. Letters and digits are read
+// by position, so the same keys work on a French or German keyboard.
+function keyName(e) {
+  if (e.key === "Escape") return "Esc";
+  if (e.key === "Enter") return "Enter";
+  if (e.key === "Tab") return "Tab";
+  if (e.key === "?") return "?";
+  if (e.code === "Space" || e.key === " ") return "Space";
+  if (e.key === "+" || e.key === "=" || e.code === "NumpadAdd") return "+";
+  if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") return "-";
+  if (/^Arrow/.test(e.key)) return e.key.slice(5);
+  const digit = /^(?:Digit|Numpad)([0-9])$/.exec(e.code || "");
+  if (digit) return digit[1];
+  const letter = /^Key([A-Z])$/.exec(e.code || "");
+  return letter ? letter[1] : null;
+}
+// Whether the player could click this element where it is: some part of it
+// is not covered by anything else. A dialog's backdrop covers whatever is
+// under it, so the keys of a covered screen go quiet by themselves.
+function onTop(el) {
+  if (!el || typeof document === "undefined") return false;
+  const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return false;
+  return [[r.left + r.width / 2, r.top + r.height / 2], [r.left + 2, r.top + 2], [r.right - 2, r.bottom - 2]]
+    .some(([x, y]) => {
+      const hit = document.elementFromPoint(x, y);
+      return !!hit && el.contains(hit);
+    });
+}
+// The button a key presses. Buttons that say what they do come first, then
+// the quiet ones (a cross, a dialog's backdrop), and last the fallback -- Esc
+// opens Settings when there is nothing left to close, but a right-click does not.
+function hotkeyTarget(name, withFallback = true) {
+  if (typeof document === "undefined") return null;
+  const rank = (el) => (el.hasAttribute("data-fallback") ? 2 : el.hasAttribute("data-quiet") ? 1 : 0);
+  return [...document.querySelectorAll(`[data-hotkey="${name}"]`)]
+    .filter((el) => !el.disabled && (withFallback || rank(el) < 2) && onTop(el))
+    .sort((a, b) => rank(a) - rank(b))[0] || null;
+}
+// The keys, as the Controls sheet lists them.
+const CONTROL_KEYS = [
+  ["Anywhere", [["Enter", "Press the main button"], ["Esc · right-click", "Back, cancel, close"],
+    ["1 – 9", "Pick from the open menu"], ["?", "This list"]]],
+  ["Battle", [["Tab · Shift+Tab", "Next, previous fighter"], ["1 – 6", "Move, Attack, Skill, Item, Wait, Info"],
+    ["Z", "Undo the move"], ["Space", "End the turn"], ["X", "Escape the battle"]]],
+  ["The view", [["Q · E", "Turn the board"], ["W A S D · arrows", "Slide the view"],
+    ["Wheel · + −", "Zoom"], ["C", "Recentre"]]],
+];
 
 function useCamera({ minZoom = 0.55, maxZoom = 1.8, tapSlop = 7, startZoom = 1, cover = null,
   bounds = null } = {}) {
@@ -5860,16 +5972,31 @@ function useCamera({ minZoom = 0.55, maxZoom = 1.8, tapSlop = 7, startZoom = 1, 
   // the map was left unblocked and a downward drag across it dismissed the
   // whole artifact. A callback ref fires when the element actually appears.
   const blockRef = useRef(null);
+  // The wheel zooms about the pointer. It is bound here for the same reason
+  // as the blocker -- a passive listener cannot stop the page zooming with
+  // it -- and reads the camera through a ref, because the listener outlives
+  // the render that bound it.
+  const wheelRef = useRef(null);
+  const liveRef = useRef(null);
   const bindEl = useCallback((el) => {
     if (elRef.current && blockRef.current) {
       elRef.current.removeEventListener("touchmove", blockRef.current);
+      elRef.current.removeEventListener("wheel", wheelRef.current);
     }
     elRef.current = el;
     if (!el) return;
     blockRef.current = (e) => {
       if (e.cancelable) e.preventDefault();
     };
+    wheelRef.current = (e) => {
+      if (!liveRef.current) return;
+      if (e.cancelable) e.preventDefault();
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+      const d = Math.max(-120, Math.min(120, e.deltaY * unit));
+      liveRef.current.zoomAt(Math.exp(-d * 0.0022), e.clientX, e.clientY);
+    };
     el.addEventListener("touchmove", blockRef.current, { passive: false });
+    el.addEventListener("wheel", wheelRef.current, { passive: false });
   }, []);
 
   // A camera given something to `cover` never lets the edge of it inside the
@@ -5914,6 +6041,28 @@ function useCamera({ minZoom = 0.55, maxZoom = 1.8, tapSlop = 7, startZoom = 1, 
       y: Math.max(mid.y - ry, Math.min(mid.y + ry, p.y)),
     };
   }
+
+  // Zoom by `f`, keeping the point under (sx, sy) where it is; with no
+  // point, about the middle of the view. The view turns about the middle of
+  // what the camera moves: a camera that moves its own element measures that
+  // middle with the pan already in it, and one that moves a child (the world
+  // map's picture) sits still, so the pan is added.
+  function zoomAt(f, sx, sy) {
+    const z2 = clampZoom(zoom * f);
+    if (z2 === zoom) return;
+    let p = { x: pan.x * (z2 / zoom), y: pan.y * (z2 / zoom) };
+    const el = elRef.current;
+    if (el && sx !== undefined && el.getBoundingClientRect) {
+      const r = el.getBoundingClientRect();
+      const own = !!(el.style && el.style.transform);
+      const cx = r.left + r.width / 2 + (own ? 0 : pan.x);
+      const cy = r.top + r.height / 2 + (own ? 0 : pan.y);
+      p = { x: pan.x + (sx - cx) * (1 - z2 / zoom), y: pan.y + (sy - cy) * (1 - z2 / zoom) };
+    }
+    setZoom(z2);
+    setPan(clampPan(p, z2));
+  }
+  liveRef.current = { zoomAt };
 
   function spread() {
     const p = [...ptrRef.current.values()];
@@ -5969,6 +6118,11 @@ function useCamera({ minZoom = 0.55, maxZoom = 1.8, tapSlop = 7, startZoom = 1, 
     startZoom,
     moved: () => movedRef.current,
     dragging: () => !!dragRef.current,
+    // The element the camera is bound to, so the keys can ask if it is on top.
+    node: () => elRef.current,
+    // The keys: slide the view, or zoom it about its middle.
+    nudge: (dx, dy) => setPan(clampPan({ x: pan.x + dx, y: pan.y + dy }, zoom)),
+    zoomAt,
     // Put a point at the centre of the view, and treat that as home.
     focus: (x, y) => {
       const z = clampZoom(startZoom);
@@ -6145,7 +6299,37 @@ export default function TurneyTactics() {
   const [demoStage, setDemoStage] = useState(null);
   const [confirmEscape, setConfirmEscape] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
-  const stageCam = useCamera({ minZoom: 0.55, maxZoom: 1.8 });
+  // How the game is being played, and the player's override of the guess.
+  // The override belongs to this device, not to a save, so it is kept on its
+  // own key rather than in SAVE_FIELDS.
+  const [controls, setControls] = useState("auto");
+  const input = useInput(controls);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.storage) return;
+    window.storage.get(CONTROLS_KEY).then((res) => {
+      if (res && CONTROL_MODES.some(([id]) => id === res.value)) setControls(res.value);
+    }).catch(() => {});
+  }, []);
+  function nextControls() {
+    const at = CONTROL_MODES.findIndex(([id]) => id === controls);
+    const next = CONTROL_MODES[(at + 1) % CONTROL_MODES.length][0];
+    setControls(next);
+    if (typeof window !== "undefined" && window.storage) window.storage.set(CONTROLS_KEY, next).catch(() => {});
+  }
+  const [showKeys, setShowKeys] = useState(false);
+  // With room and a mouse the board opens fitted to the window, and may be
+  // zoomed further in than a phone's.
+  const stageCam = useCamera(input.desk
+    ? { minZoom: 0.55, maxZoom: 3, startZoom: input.fit }
+    : { minZoom: 0.55, maxZoom: 1.8 });
+  // A window that gains or loses the room takes the new opening zoom.
+  const deskWas = useRef(input.desk);
+  useEffect(() => {
+    if (deskWas.current === input.desk) return;
+    deskWas.current = input.desk;
+    stageCam.reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input.desk]);
   // The map is 840 wide in a phone's ~390: opening at 1:1 dropped the player
   // into a corner of one island at four times pixel size. MAP_START_ZOOM puts
   // the whole world on screen, and the markers counter-scale by it so the
@@ -6153,9 +6337,10 @@ export default function TurneyTactics() {
   const mapCam = useCamera({
     minZoom: 0.3, maxZoom: 3, startZoom: MAP_START_ZOOM,
     cover: { w: MAP_W, h: MAP_H },
-    // The picture still has to fill the frame -- that is what `cover` is for,
-    // and it keeps the blue backdrop out of shot. What the player may reach is
-    // narrower until the world is charted.
+    // The picture still has to fill the frame -- that is what `cover` is for.
+    // What the player may reach is narrower until the world is charted, and a
+    // window wider than the island then sees past the picture's edge: the
+    // screen's backdrop is the fog's own colour until then, so nothing shows.
     bounds: worldCharted(cleared) ? null : CHARTED_BOUNDS,
   });
   // Opening the map looks at wherever the company is standing. Keyed on the
@@ -9079,6 +9264,105 @@ function addTileEffect(x, y, kind, delay) {
     }
   }
 
+  // Tab: the next fighter who can still act, or on the map the next place
+  // the company can stand. The board goes through the same click a tap
+  // makes, so selecting by key cannot differ from selecting by hand.
+  function cycle(step) {
+    if (screen === "map") {
+      const places = [...document.querySelectorAll("[data-place]")].filter((b) => !b.disabled && onTop(b));
+      if (!places.length) return false;
+      // The road climbs north, so the bottom of the map comes first.
+      const at = (b) => b.getBoundingClientRect();
+      places.sort((a, b) => at(b).top - at(a).top || at(a).left - at(b).left);
+      const here = places.findIndex((b) => b.dataset.place === mapPos);
+      const go = here < 0 ? (step > 0 ? 0 : places.length - 1) : (here + step + places.length) % places.length;
+      places[go].click();
+      return true;
+    }
+    if (turn !== "player" || gameOver || (active && active.stage !== "menu") || !onTop(stageCam.node())) return false;
+    const ready = units.filter((u) => u.team === "player" && u.alive && !isDone(u));
+    if (!ready.length) return false;
+    const here = ready.findIndex((u) => active && u.id === active.unitId);
+    const go = here < 0 ? (step > 0 ? 0 : ready.length - 1) : (here + step + ready.length) % ready.length;
+    if (go !== here) handleCellClick(ready[go].x, ready[go].y);
+    return true;
+  }
+  // One listener for every key. A key presses the button that carries it;
+  // failing that, the view keys drive whichever camera is on top.
+  function onHotkey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+    const name = keyName(e);
+    if (!name) return;
+    const view = /^(W|A|S|D|Up|Down|Left|Right|\+|-)$/.test(name);
+    if (e.repeat && !view) return;
+    const focus = document.activeElement;
+    if (focus && focus.tagName === "BUTTON") {
+      // A button reached with Tab is the browser's to press. One that only
+      // holds focus because it was clicked lets go, so Enter or Space cannot
+      // press it a second time.
+      if (focus.matches(":focus-visible")) {
+        if (name === "Enter" || name === "Space") return;
+      } else focus.blur();
+    }
+    if (name === "Tab") {
+      if (cycle(e.shiftKey ? -1 : 1)) e.preventDefault();
+      return;
+    }
+    const button = hotkeyTarget(name);
+    if (button) {
+      e.preventDefault();
+      button.click();
+      return;
+    }
+    if (name === "?") {
+      e.preventDefault();
+      setShowKeys(true);
+      return;
+    }
+    const cam = [mapCam, stageCam].find((c) => onTop(c.node()));
+    if (!cam) return;
+    const step = 64;
+    const slide = { W: [0, step], Up: [0, step], S: [0, -step], Down: [0, -step],
+      A: [step, 0], Left: [step, 0], D: [-step, 0], Right: [-step, 0] }[name];
+    if (slide) cam.nudge(slide[0], slide[1]);
+    else if (name === "+" || name === "-") cam.zoomAt(name === "+" ? 1.15 : 1 / 1.15);
+    else if (name === "C") cam.reset();
+    else return;
+    e.preventDefault();
+  }
+  const hotkeyRef = useRef(null);
+  hotkeyRef.current = onHotkey;
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const press = (e) => hotkeyRef.current && hotkeyRef.current(e);
+    window.addEventListener("keydown", press);
+    return () => window.removeEventListener("keydown", press);
+  }, []);
+  // A right-click goes back, as Esc does -- but never opens Settings.
+  function onRightClick(e) {
+    e.preventDefault();
+    const button = hotkeyTarget("Esc", false);
+    if (button) button.click();
+  }
+  // The tile under the mouse lights up where a click would do something. The
+  // browser's own hover does not reliably reach the raised tiles, so the tile
+  // is found from the pointer, as a click finds it.
+  const hoverRef = useRef(null);
+  function hoverTile(e) {
+    if (!input.mouse) return;
+    const el = e && e.pointerType === "mouse" && !stageCam.dragging()
+      ? document.elementsFromPoint(e.clientX, e.clientY).find((n) => n.dataset && n.dataset.cell) || null
+      : null;
+    if (hoverRef.current === el) return;
+    if (hoverRef.current) delete hoverRef.current.dataset.hover;
+    if (el) el.dataset.hover = "";
+    hoverRef.current = el;
+  }
+  // The word for pressing a tile or an entry, as this player presses it.
+  const tapWord = input.mouse ? "Click" : "Tap";
+
   function endTurn() {
     clearSelection();
     setMoveUndo(null);
@@ -9235,7 +9519,9 @@ function addTileEffect(x, y, kind, delay) {
 
   return (
     <div
-      className="text-slate-100 flex flex-col items-center px-3 pt-3 rpg-font"
+      className={`text-slate-100 flex flex-col items-center px-3 pt-3 rpg-font${input.desk ? " is-desk" : ""}${
+        input.stack ? " is-stacked" : ""}${input.mouse ? " is-mouse" : ""}${input.caps ? " has-caps" : ""}`}
+      onContextMenu={input.mouse ? onRightClick : undefined}
       style={{
         height: "100dvh",
         overflow: "hidden",
@@ -9243,9 +9529,12 @@ function addTileEffect(x, y, kind, delay) {
         backgroundColor: "#181425",
         backgroundImage: `url(${SKY_IMAGE})`,
         backgroundSize: "cover",
-        backgroundPosition: "center top",
+        // A wide window shows a slice of the tall sky: its bottom edge keeps
+        // the sun and the hills in view, where the top shows only stars.
+        backgroundPosition: input.desk ? "center bottom" : "center top",
         backgroundRepeat: "no-repeat",
         backgroundAttachment: "fixed",
+        ...(input.desk ? { "--ui": input.ui } : null),
       }}
     >
       <style>{`
@@ -9695,6 +9984,60 @@ function addTileEffect(x, y, kind, delay) {
         .tce43b44 { color: #e43b44; }
         .tcf6757a { color: #f6757a; }
         .tcfee761 { color: #fee761; }
+        /* Desktop play. Every rule is scoped under a class the root wears
+           only when the input check says so -- is-desk: room and a mouse;
+           is-mouse: a mouse is the main pointer; has-caps: keys are in play
+           -- so a phone draws exactly what it drew before. Panels scale by
+           one number, --ui, and the board and the map never do: their
+           cameras do the pixel maths. */
+        .is-desk .ui-zoom { zoom: var(--ui); }
+        .is-desk .ui-hud { zoom: calc(var(--ui) * 1.35); }
+        .is-desk .hud-left {
+          position: absolute; left: 14px; top: 12px; z-index: 20; margin: 0;
+          padding: 5px 11px; color: #c0cbdc; background: #262b44;
+          border: 2px solid #8b9bb4; border-radius: 3px; box-shadow: 0 2px 0 #181425;
+        }
+        .is-desk .hud-right { position: absolute; right: 14px; top: 12px; margin: 0; }
+        .is-desk .hud-msg { margin-top: 56px; }
+        .is-desk .dock-corner {
+          position: fixed; right: 14px; bottom: 14px; min-width: 168px; max-width: 320px;
+          max-height: calc((100dvh - 28px) / var(--ui)); overflow-y: auto;
+        }
+        .is-stacked .dock-corner { bottom: 76px; }
+        .is-desk .dock-strip { pointer-events: none; }
+        .is-desk .dock-strip > * { pointer-events: auto; }
+        .is-desk .sheet-head { max-width: 24rem; width: 100%; margin-left: auto; margin-right: auto; }
+        .is-desk .muster { justify-content: center; padding-bottom: 5vh; }
+        .is-desk .muster-list { flex: 0 1 auto; }
+        .is-desk .sheet-short, .is-desk .sheet-mid { max-height: calc((100dvh - 48px) / var(--ui)); }
+        .is-mouse { user-select: none; -webkit-user-select: none; }
+        .is-mouse [data-cell].cursor-pointer[data-hover] {
+          outline: 3px solid #fee761; outline-offset: -3px; animation: none; filter: brightness(1.35);
+        }
+        /* A key cap, printed from the button's own data-hotkey. */
+        .has-caps [data-hotkey]:not([data-quiet])::after, .key-cap {
+          /* The cap is for the eye: the empty alternative keeps it out of the
+             button's spoken name. A browser without that syntax keeps the
+             first line and still draws the cap. */
+          content: attr(data-hotkey);
+          content: attr(data-hotkey) / "";
+          display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;
+          min-width: 15px; height: 15px; padding: 0 4px; margin-left: 6px; border-radius: 3px;
+          background: rgba(24, 20, 37, 0.55); color: #f4f4f8;
+          border: 1px solid rgba(255, 255, 255, 0.4); border-bottom-width: 2px;
+          font-family: 'VT323', monospace; font-size: 14px; font-weight: 400; line-height: 1;
+          letter-spacing: 0; text-transform: none; text-shadow: none; white-space: nowrap;
+        }
+        .has-caps [data-cap="end"]::after { margin-left: auto; }
+        .has-caps [data-cap="corner"], .has-caps [data-cap="badge"] { position: relative; }
+        .has-caps [data-cap="corner"]::after {
+          position: absolute; top: 3px; right: 3px; margin: 0;
+          min-width: 12px; height: 12px; padding: 0 2px; font-size: 12px;
+        }
+        .has-caps [data-cap="badge"]::after { position: absolute; top: -7px; left: -7px; margin: 0; }
+        .has-caps .rpg-chip[data-hotkey] { display: inline-flex; align-items: center; }
+        .has-caps button:focus-visible { outline: 2px solid #fee761; outline-offset: 2px; }
+        .key-cap { margin-left: 12px; background: #ead4aa; color: #3e2731; border-color: #8a5a3c; }
         @keyframes tactics-save-flash {
           0%, 45% { opacity: 1; }
           100% { opacity: 0; }
@@ -9705,7 +10048,7 @@ function addTileEffect(x, y, kind, delay) {
         }
       `}</style>
 
-      <div className="flex items-center gap-3 type-mid text-slate-400 mb-2">
+      <div className="flex items-center gap-3 type-mid text-slate-400 mb-2 hud-left ui-hud">
         <span>
           Party {partyAlive}/{startingParty}
         </span>
@@ -9732,14 +10075,15 @@ function addTileEffect(x, y, kind, delay) {
       {combatMessage && (
         <button
           onClick={() => setShowLog(true)}
-          className="w-full max-w-sm mb-2 text-center text-xs tcfee761 hover:brightness-125"
+          className="w-full max-w-sm mb-2 text-center text-xs tcfee761 hover:brightness-125 hud-msg ui-zoom"
         >
           {combatMessage}
         </button>
       )}
 
-      <div className="mb-2 flex items-center gap-2 relative z-20">
+      <div className="mb-2 flex items-center gap-2 relative z-20 hud-right ui-hud">
         <button
+          data-hotkey="Q"
           onClick={rotateLeft}
           aria-label="Rotate view left"
           className="tcc0cbdc hover:brightness-125 p-2.5 rd3px rpg-chip"
@@ -9753,6 +10097,7 @@ function addTileEffect(x, y, kind, delay) {
             says the view is being brought back; a crosshair reads as aiming a
             weapon, on a board where aiming is something you do to people. */}
         <button
+          data-hotkey="C"
           onClick={stageCam.reset}
           aria-label="Recentre the stage"
           className="p-2.5 rd3px rpg-chip"
@@ -9761,6 +10106,7 @@ function addTileEffect(x, y, kind, delay) {
           <Recentre size={14} />
         </button>
         <button
+          data-hotkey="E"
           onClick={rotateRight}
           aria-label="Rotate view right"
           className="tcc0cbdc hover:brightness-125 p-2.5 rd3px rpg-chip"
@@ -9768,6 +10114,8 @@ function addTileEffect(x, y, kind, delay) {
           <RotateCw size={14} />
         </button>
         <button
+          data-hotkey="Esc"
+          data-fallback
           onClick={() => setScreen("settings")}
           aria-label="Settings"
           className="tcc0cbdc hover:brightness-125 p-2.5 rd3px rpg-chip"
@@ -9779,10 +10127,19 @@ function addTileEffect(x, y, kind, delay) {
       <div
         className="flex items-center justify-center"
         {...stageCam.handlers}
+        onPointerMove={(e) => {
+          stageCam.handlers.onPointerMove(e);
+          hoverTile(e);
+        }}
+        onPointerLeave={(e) => {
+          stageCam.handlers.onPointerLeave(e);
+          hoverTile(null);
+        }}
         style={{
           perspective: "1400px",
           width: "100%",
-          maxWidth: DIMS.wrapper,
+          // With room the whole window is the stage, so a drag anywhere moves it.
+          maxWidth: input.desk ? "none" : DIMS.wrapper,
           // grow into whatever room is left, so the board sits centred
           // between the toolbar and the panels instead of overlapping them
           flex: "1 1 auto",
@@ -9845,6 +10202,7 @@ function addTileEffect(x, y, kind, delay) {
                   <div
                     key={k}
                     onClick={() => clickable && handleCellClick(x, y)}
+                    data-cell={input.mouse ? k : undefined}
                     className={[
                       "rounded-sm",
                       isReachable || isAttackable || isAbilityTile || isHealable ? "tactics-live-tile" : "",
@@ -10417,12 +10775,15 @@ function addTileEffect(x, y, kind, delay) {
           bottom panel, hugging its own buttons rather than spanning the
           screen. One column, one row of chrome, nothing repeated from Info. */}
       {active && activeUnit && active.stage === "menu" && (
-        <div className="absolute z-20 rounded-lg p-1.5 tactics-panel" style={{ right: 10, top: 92 }}>
+        <div
+          className="absolute z-20 rounded-lg p-1.5 tactics-panel dock-corner ui-zoom"
+          style={input.desk ? undefined : { right: 10, top: 92 }}
+        >
           <div className="flex items-center justify-between gap-2 px-0.5 pb-1">
             <span className="text-sm font-bold truncate" style={{ letterSpacing: "0.02em" }}>
               {activeUnit.name}
             </span>
-            <button onClick={clearSelection} className="text-slate-500 hover:text-slate-300">
+            <button data-hotkey="Esc" data-quiet onClick={clearSelection} className="text-slate-500 hover:text-slate-300">
               <X size={13} />
             </button>
           </div>
@@ -10440,11 +10801,13 @@ function addTileEffect(x, y, kind, delay) {
                 () => setActive({ unitId: activeUnit.id, stage: "facing" })],
               ["Info", Info, true, "bgf77622 hvfeae34 text-white",
                 () => setPeek({ unitId: activeUnit.id, stage: "info" })],
-            ].map(([label, ActionIcon, enabled, tone, onPick, openable = enabled]) => (
+            ].map(([label, ActionIcon, enabled, tone, onPick, openable = enabled], i) => (
               // `enabled` dresses the button; `openable` decides whether the tap
               // fires. They differ only for Skill, whose greyed face still opens.
               <button
                 key={label}
+                data-hotkey={String(i + 1)}
+                data-cap="end"
                 disabled={!openable}
                 onClick={onPick}
                 className={`flex items-center gap-1.5 px-2 py-1 rpg-btn text-sm font-bold ${
@@ -10455,7 +10818,7 @@ function addTileEffect(x, y, kind, delay) {
               </button>
             ))}
             {canUndoMove && (
-              <button onClick={undoMove} className="flex items-center gap-1 px-1 type-body tc2ce8f5 hover:text-sky-200">
+              <button data-hotkey="Z" onClick={undoMove} className="flex items-center gap-1 px-1 type-body tc2ce8f5 hover:text-sky-200">
                 <Undo2 size={11} /> Undo
               </button>
             )}
@@ -10468,25 +10831,26 @@ function addTileEffect(x, y, kind, delay) {
       <div style={{ height: 128, flexShrink: 0 }} />
 
       <div
-        className="absolute left-0 right-0 bottom-0 z-20 px-3 pb-3 flex flex-col items-center"
+        className="absolute left-0 right-0 bottom-0 z-20 px-3 pb-3 flex flex-col items-center dock-strip ui-zoom"
         style={{ maxHeight: "64dvh", overflowY: "auto" }}
       >
       {/* The action menu has its own overlay; everything below is the running
           commentary for whatever the fighter is in the middle of doing. Stats
           are not repeated here — Info owns them. */}
       {active && activeUnit && active.stage !== "menu" ? (
-        <div className="w-full max-w-sm rounded-lg p-3 tactics-panel relative z-20">
+        <div className="w-full max-w-sm rounded-lg p-3 tactics-panel relative z-20 dock-corner">
           <div className="flex items-center justify-between gap-2 mb-2">
             <span className="text-sm font-semibold">{activeUnit.name}</span>
-            <button onClick={clearSelection} className="text-slate-500 hover:text-slate-300">
+            <button data-hotkey="Esc" data-quiet onClick={clearSelection} className="text-slate-500 hover:text-slate-300">
               <X size={18} />
             </button>
           </div>
 
           {active.stage === "moving" && (
             <div className="flex items-center justify-between">
-              <p className="text-xs tc2ce8f5">Tap a blue tile to move there. Faded tiles can be crossed, not held.</p>
+              <p className="text-xs tc2ce8f5">{`${tapWord} a blue tile to move there. Faded tiles can be crossed, not held.`}</p>
               <button
+                data-hotkey="Esc"
                 onClick={() => setActive({ unitId: activeUnit.id, stage: "menu" })}
                 className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
               >
@@ -10500,6 +10864,7 @@ function addTileEffect(x, y, kind, delay) {
               <div className="flex items-center justify-between mb-2">
                 <p className="text-xs text-emerald-300">Choose something from the satchel.</p>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => setActive({ unitId: activeUnit.id, stage: "menu" })}
                   className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
                 >
@@ -10507,12 +10872,14 @@ function addTileEffect(x, y, kind, delay) {
                 </button>
               </div>
               <div className="space-y-1.5">
-                {CONSUMABLE_KEYS.filter((k) => (supplies[k] || 0) > 0).map((k) => {
+                {CONSUMABLE_KEYS.filter((k) => (supplies[k] || 0) > 0).map((k, i) => {
                   const c = CONSUMABLES[k];
                   const ready = usableItems.includes(k);
                   return (
                     <button
                       key={k}
+                      data-hotkey={i < 9 ? String(i + 1) : undefined}
+                      data-cap="badge"
                       disabled={!ready}
                       onClick={() => setActive({ unitId: activeUnit.id, stage: "item", itemKey: k })}
                       className={`w-full text-left rd3px p-2 border-2 ${
@@ -10539,10 +10906,11 @@ function addTileEffect(x, y, kind, delay) {
             <div className="flex items-center justify-between">
               <p className="text-xs text-emerald-300">
                 {itemDef.raise
-                  ? `Tap a fallen ally within ${itemDef.reach} to spend the ${itemDef.name}.`
-                  : `Tap a green ally to use the ${itemDef.name} (${supplies[active.itemKey] || 0} left).`}
+                  ? `${tapWord} a fallen ally within ${itemDef.reach} to spend the ${itemDef.name}.`
+                  : `${tapWord} a green ally to use the ${itemDef.name} (${supplies[active.itemKey] || 0} left).`}
               </p>
               <button
+                data-hotkey="Esc"
                 onClick={() => setActive({ unitId: activeUnit.id, stage: "itemList" })}
                 className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
               >
@@ -10553,8 +10921,9 @@ function addTileEffect(x, y, kind, delay) {
 
           {active.stage === "attacking" && !pendingAttack && (
             <div className="flex items-center justify-between">
-              <p className="text-xs text-rose-300">Tap a red enemy to preview the attack.</p>
+              <p className="text-xs text-rose-300">{`${tapWord} a red enemy to preview the attack.`}</p>
               <button
+                data-hotkey="Esc"
                 onClick={() => {
                   setActive({ unitId: activeUnit.id, stage: "menu" });
                   setPendingAttack(null);
@@ -10615,12 +10984,14 @@ function addTileEffect(x, y, kind, delay) {
               )}
               <div className="flex gap-2 mt-1">
                 <button
+                  data-hotkey="Enter"
                   onClick={confirmAttack}
                   className="flex-1 bga22633 hve43b44 text-white text-xs font-semibold py-1.5 rpg-btn"
                 >
                   Confirm Attack
                 </button>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => setPendingAttack(null)}
                   className="bg3a4466 hv5a6988 text-slate-200 text-xs font-semibold py-1.5 px-3 rpg-btn"
                 >
@@ -10635,6 +11006,7 @@ function addTileEffect(x, y, kind, delay) {
               <div className="flex items-center justify-between mb-2">
                 <p className="text-xs tcb55088">Choose a skill.</p>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => setActive({ unitId: activeUnit.id, stage: "menu" })}
                   className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
                 >
@@ -10642,12 +11014,14 @@ function addTileEffect(x, y, kind, delay) {
                 </button>
               </div>
               <div className="space-y-1.5">
-                {unitSkills.map((sk) => {
+                {unitSkills.map((sk, i) => {
                   const cd = cooldownOf(activeUnit, sk.id);
                   const ready = cd === 0;
                   return (
                     <button
                       key={sk.id}
+                      data-hotkey={i < 9 ? String(i + 1) : undefined}
+                      data-cap="badge"
                       disabled={!ready}
                       onClick={() => {
                         setPendingAbility(sk.target === "self" ? { self: true } : null);
@@ -10676,12 +11050,13 @@ function addTileEffect(x, y, kind, delay) {
             <div className="flex items-center justify-between">
               <p className="text-xs tcb55088">
                 {abilityDef.target === "tile"
-                  ? `Tap a violet tile to aim ${abilityDef.name}.`
+                  ? `${tapWord} a violet tile to aim ${abilityDef.name}.`
                   : abilityDef.target === "ally"
-                  ? `Tap a violet ally to use ${abilityDef.name}.`
-                  : `Tap a violet enemy to use ${abilityDef.name}.`}
+                  ? `${tapWord} a violet ally to use ${abilityDef.name}.`
+                  : `${tapWord} a violet enemy to use ${abilityDef.name}.`}
               </p>
               <button
+                data-hotkey="Esc"
                 onClick={() => {
                   setActive({ unitId: activeUnit.id, stage: "skillList" });
                   setPendingAbility(null);
@@ -10754,6 +11129,7 @@ function addTileEffect(x, y, kind, delay) {
               )}
               <div className="flex gap-2">
                 <button
+                  data-hotkey="Enter"
                   onClick={confirmAbility}
                   disabled={!abilityReady}
                   className={`flex-1 text-xs font-semibold py-1.5 rpg-btn ${
@@ -10763,6 +11139,7 @@ function addTileEffect(x, y, kind, delay) {
                   Unleash
                 </button>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => setPendingAbility(null)}
                   className="bg3a4466 hv5a6988 text-slate-200 text-xs font-semibold py-1.5 px-3 rpg-btn"
                 >
@@ -10784,12 +11161,14 @@ function addTileEffect(x, y, kind, delay) {
               <div className="text-xs font-semibold tcb55088 mb-2">{abilityDef.name}</div>
               <div className="flex gap-2">
                 <button
+                  data-hotkey="Enter"
                   onClick={confirmAbility}
                   className="flex-1 bg68386c hvb55088 text-white text-xs font-semibold py-1.5 rpg-btn"
                 >
                   Confirm
                 </button>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => {
                     setPendingAbility(null);
                     setActive({ unitId: activeUnit.id, stage: "skillList" });
@@ -10875,12 +11254,14 @@ function addTileEffect(x, y, kind, delay) {
               })()}
               <div className="flex gap-2">
                 <button
+                  data-hotkey="Enter"
                   onClick={confirmAbility}
                   className="flex-1 bg68386c hvb55088 text-white text-xs font-semibold py-1.5 rpg-btn"
                 >
                   Confirm
                 </button>
                 <button
+                  data-hotkey="Esc"
                   onClick={() => setPendingAbility(null)}
                   className="bg3a4466 hv5a6988 text-slate-200 text-xs font-semibold py-1.5 px-3 rpg-btn"
                 >
@@ -10894,9 +11275,11 @@ function addTileEffect(x, y, kind, delay) {
             <div>
               <p className="text-xs text-slate-300 mb-2 text-center">Choose a facing direction for next turn.</p>
               <div className="grid grid-cols-4 gap-2">
-                {["N", "E", "S", "W"].map((dir) => (
+                {["N", "E", "S", "W"].map((dir, i) => (
                   <button
                     key={dir}
+                    data-hotkey={String(i + 1)}
+                    data-cap="corner"
                     onClick={() => {
                       updateUnit(activeUnit.id, facingPatch(dir));
                       setMoveUndo(null);
@@ -10917,6 +11300,7 @@ function addTileEffect(x, y, kind, delay) {
                 ))}
               </div>
               <button
+                data-hotkey="Esc"
                 onClick={() => setActive({ unitId: activeUnit.id, stage: "menu" })}
                 className="mt-2 flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
               >
@@ -10931,6 +11315,7 @@ function addTileEffect(x, y, kind, delay) {
 
       <div className="w-full max-w-sm mt-3 flex gap-2 relative z-20">
         <button
+          data-hotkey={turn === "deploy" ? "Enter" : "Space"}
           onClick={turn === "deploy" ? beginBattle : () => setConfirmEnd(true)}
           disabled={(turn !== "player" && turn !== "deploy") || !!gameOver}
           className={`flex-1 dsbg3a4466 dstc5a6988 text-white text-base font-bold py-3 rpg-btn transition-colors flex items-center justify-center gap-1.5 ${
@@ -10946,6 +11331,7 @@ function addTileEffect(x, y, kind, delay) {
           )}
         </button>
         <button
+          data-hotkey="X"
           onClick={() => setConfirmEscape(true)}
           className="bga22633 hve43b44 text-white text-sm font-semibold py-2 px-3 rpg-btn flex items-center gap-1.5"
         >
@@ -10983,7 +11369,7 @@ function addTileEffect(x, y, kind, delay) {
                       Lv{peekUnit.level} {peekUnit.title || peekUnit.class} · {peekUnit.team === "player" ? "Ally" : "Enemy"}
                     </div>
                   </div>
-                  <button onClick={() => setPeek(null)} className="text-slate-500 hover:text-slate-300">
+                  <button data-hotkey="Esc" data-quiet onClick={() => setPeek(null)} className="text-slate-500 hover:text-slate-300">
                     <X size={18} />
                   </button>
                 </div>
@@ -10999,7 +11385,7 @@ function addTileEffect(x, y, kind, delay) {
 
                 {peek.stage === "info" && (
                   <div className="mt-2">
-                    <p className="type-body text-slate-500 mb-2">Tap any entry below for details.</p>
+                    <p className="type-body text-slate-500 mb-2">{`${tapWord} any entry below for details.`}</p>
                     <div className="flex justify-between text-xs text-slate-300 mb-1">
                       <span>HP</span>
                       <span>
@@ -11189,12 +11575,13 @@ function addTileEffect(x, y, kind, delay) {
                 <div className="text-sm font-semibold tcfee761">{detail.title}</div>
                 {detail.sub && <div className="type-mid text-slate-400 mt-0.5">{detail.sub}</div>}
               </div>
-              <button onClick={() => setDetail(null)} className="text-slate-500 hover:text-slate-300">
+              <button data-hotkey="Esc" data-quiet onClick={() => setDetail(null)} className="text-slate-500 hover:text-slate-300">
                 <X size={18} />
               </button>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-line">{detail.body}</p>
             <button
+              data-hotkey="Esc"
               onClick={() => setDetail(null)}
               className="w-full mt-3 bg3a4466 hv5a6988 text-slate-200 text-xs font-semibold py-1.5 rpg-btn"
             >
@@ -11234,7 +11621,7 @@ function addTileEffect(x, y, kind, delay) {
                   two crosses on one screen is one too many. Out on the road
                   there is no header, so this is the only one. */}
               {gearFrom !== "town" && (
-                <button onClick={closeGear} className="text-slate-500 hover:text-slate-300">
+                <button data-hotkey="Esc" data-quiet onClick={closeGear} className="text-slate-500 hover:text-slate-300">
                   <X size={18} />
                 </button>
               )}
@@ -11383,6 +11770,7 @@ function addTileEffect(x, y, kind, delay) {
             )}
 
             <button
+              data-hotkey="Esc"
               onClick={closeGear}
               className="w-full mt-3 bgfeae34 hvfee761 text-slate-900 text-xs font-semibold py-2 rpg-btn"
             >
@@ -11392,13 +11780,13 @@ function addTileEffect(x, y, kind, delay) {
             </button>
 </>);
         return (
-          <div className="fixed inset-0 z-80 flex flex-col" style={{ background: "#1b1330" }}>
+          <div className="fixed inset-0 z-80 flex flex-col ui-zoom" style={{ background: "#1b1330" }}>
             <div
               className="absolute inset-0"
               style={{ backgroundImage: `url(${SKY_IMAGE})`, backgroundSize: "cover", opacity: 0.3 }}
             />
             {gearFrom === "town" && (
-            <div className="relative z-10 pt-3 px-4 flex items-center gap-2">
+            <div className="relative z-10 pt-3 px-4 flex items-center gap-2 sheet-head">
               <Home size={16} style={{ color: "#fee761" }} />
               <span className="flex-1 rpg-title type-fine" style={{ color: "#fee761", textShadow: "2px 2px 0 #181425" }}>
                 {(townAt(mapPos) || TOWNS[0]).name}
@@ -11406,7 +11794,7 @@ function addTileEffect(x, y, kind, delay) {
               <span className="flex items-center gap-1 text-xs font-bold" style={{ color: "#fee761" }}>
                 <Coins size={13} /> {gold}g
               </span>
-              <button onClick={closeGear} className="text-slate-300 hover:text-white">
+              <button data-hotkey="Esc" data-quiet onClick={closeGear} className="text-slate-300 hover:text-white">
                 <X size={20} />
               </button>
             </div>
@@ -11416,6 +11804,8 @@ function addTileEffect(x, y, kind, delay) {
               {TOWN_DOORS.map(([id, label, DoorIcon], i) => (
                 <button
                   key={id}
+                  data-hotkey={String(i + 1)}
+                  data-cap="corner"
                   onClick={() => {
                     setCart([]);
                     if (id !== "gear") { setTownTab(id); setScreen("town"); }
@@ -11524,10 +11914,10 @@ function addTileEffect(x, y, kind, delay) {
         };
 
         return (
-          <div className="fixed inset-0 z-85 flex flex-col" style={{ background: "#1b1330" }}>
+          <div className="fixed inset-0 z-85 flex flex-col ui-zoom" style={{ background: "#1b1330" }}>
             <div className="absolute inset-0" style={{ backgroundImage: `url(${SKY_IMAGE})`, backgroundSize: "cover", opacity: 0.25 }} />
 
-            <div className="relative z-10 pt-3 px-3 flex items-center gap-2">
+            <div className="relative z-10 pt-3 px-3 flex items-center gap-2 sheet-head">
               <Portrait classKey={u.class} name={u.name} sprite={u.sprite} size={30} />
               <span className="flex-1">
                 <span className="block type-mid font-bold" style={{ color: "#fee761" }}>
@@ -11537,7 +11927,7 @@ function addTileEffect(x, y, kind, delay) {
                   {pts > 0 ? `${pts} skill point${pts === 1 ? "" : "s"} to spend` : "No points available"}
                 </span>
               </span>
-              <button onClick={() => { setScreen(treeFrom); setTreeNode(null); }} className="text-slate-300 hover:text-white">
+              <button data-hotkey="Esc" data-quiet onClick={() => { setScreen(treeFrom); setTreeNode(null); }} className="text-slate-300 hover:text-white">
                 <X size={20} />
               </button>
             </div>
@@ -11560,7 +11950,7 @@ function addTileEffect(x, y, kind, delay) {
             </div>
 
             {academyTab === "skills" && (<>
-            <div className="relative z-10 flex gap-1 px-3 pt-2">
+            <div className="relative z-10 flex gap-1 px-3 pt-2 sheet-head">
               {specs.map((sp) => (
                 <button
                   key={sp.id}
@@ -11894,6 +12284,7 @@ function addTileEffect(x, y, kind, delay) {
 
             <div className="relative z-10 px-3 pt-2 pb-4 max-w-sm mx-auto w-full">
               <button
+                data-hotkey="Esc"
                 onClick={() => { setScreen(treeFrom); setTreeNode(null); setPendingRaises([]); }}
                 className="w-full bgfeae34 hvfee761 text-slate-900 text-sm font-bold py-2.5 rpg-btn"
               >
@@ -11911,7 +12302,7 @@ function addTileEffect(x, y, kind, delay) {
         <Modal z="z-80" width="max-w-sm" inset="px-4" onClose={() => setShowLog(false)}>
           <div className="flex items-center justify-between mb-2">
             <span className="rpg-title type-mid tc8a3d12">Battle Log</span>
-            <button onClick={() => setShowLog(false)} className="tc6d4a30 hover:brightness-125">
+            <button data-hotkey="Esc" data-quiet onClick={() => setShowLog(false)} className="tc6d4a30 hover:brightness-125">
               <X size={16} />
             </button>
           </div>
@@ -11930,7 +12321,7 @@ function addTileEffect(x, y, kind, delay) {
       )}
 
       {screen === "muster" && (
-        <div className="fixed inset-0 z-80 flex flex-col" style={{ background: "#1b1330" }}>
+        <div className="fixed inset-0 z-80 flex flex-col muster ui-zoom" style={{ background: "#1b1330" }}>
           <div
             className="absolute inset-0"
             style={{ backgroundImage: `url(${SKY_IMAGE})`, backgroundSize: "cover", opacity: 0.3 }}
@@ -11941,7 +12332,7 @@ function addTileEffect(x, y, kind, delay) {
             </div>
           </div>
 
-          <div className="relative z-10 flex-1 overflow-y-auto px-3 py-3">
+          <div className="relative z-10 flex-1 overflow-y-auto px-3 py-3 muster-list">
             <div className="tactics-panel rounded-lg p-3 max-w-sm mx-auto">
               <AcademyRoster party={units.filter((u) => u.team === "player")} />
             </div>
@@ -11958,6 +12349,7 @@ function addTileEffect(x, y, kind, delay) {
               <span>{ironman ? "On" : "Off"}</span>
             </button>
             <button
+              data-hotkey="Enter"
               onClick={() => setScreen(null)}
               className="w-full bgfeae34 hvfee761 text-slate-900 text-sm font-bold py-2.5 rpg-btn flex items-center justify-center gap-1.5"
             >
@@ -12046,6 +12438,7 @@ function addTileEffect(x, y, kind, delay) {
                   <Plus size={13} />
                 </button>
                 <button
+                  data-hotkey="Esc" data-quiet
                   onClick={onClear}
                   aria-label={`Take every ${title} out of the cart`}
                   className="ml-auto w-7 h-7 flex items-center justify-center rpg-btn bga22633 hve43b44 text-white"
@@ -12060,7 +12453,7 @@ function addTileEffect(x, y, kind, delay) {
         const inCart = (uid) => cart.some((l) => l.uid === uid);
 
         return (
-          <div className="fixed inset-0 z-80 flex flex-col" style={{ background: "#2a1a3e" }}>
+          <div className="fixed inset-0 z-80 flex flex-col ui-zoom" style={{ background: "#2a1a3e" }}>
             <div
               className="absolute inset-0"
               style={{
@@ -12072,7 +12465,7 @@ function addTileEffect(x, y, kind, delay) {
             />
 
             {/* header */}
-            <div className="relative z-10 pt-3 px-4 flex items-center gap-2">
+            <div className="relative z-10 pt-3 px-4 flex items-center gap-2 sheet-head">
               <Home size={16} style={{ color: "#fee761" }} />
               <span className="flex-1 rpg-title type-fine" style={{ color: "#fee761", textShadow: "2px 2px 0 #181425" }}>
                 {(townAt(mapPos) || TOWNS[0]).name}
@@ -12080,7 +12473,7 @@ function addTileEffect(x, y, kind, delay) {
               <span className="flex items-center gap-1 text-xs font-bold" style={{ color: "#fee761" }}>
                 <Coins size={13} /> {gold}g
               </span>
-              <button onClick={leaveTown} className="text-slate-300 hover:text-white">
+              <button data-hotkey="Esc" data-quiet onClick={leaveTown} className="text-slate-300 hover:text-white">
                 <X size={20} />
               </button>
             </div>
@@ -12092,6 +12485,8 @@ function addTileEffect(x, y, kind, delay) {
               {TABS.map(([id, label, TabIcon, alert], i) => (
                 <button
                   key={id}
+                  data-hotkey={String(i + 1)}
+                  data-cap="corner"
                   onClick={() => {
                     setCart([]);
                     if (id === "gear") openGear("town");
@@ -12399,6 +12794,7 @@ function addTileEffect(x, y, kind, delay) {
                 </div>
               )}
               <button
+                data-hotkey="Esc"
                 onClick={leaveTown}
                 className="w-full bgfeae34 hvfee761 text-slate-900 text-sm font-bold py-2.5 rpg-btn"
               >
@@ -12416,7 +12812,7 @@ function addTileEffect(x, y, kind, delay) {
         const leader =
           units.find((v) => v.team === "player" && v.alive) || poolUnit(roster[0]) || { class: "Squire" };
         return (
-          <div className="fixed inset-0 z-70 flex flex-col" style={{ background: "#124e89" }}>
+          <div className="fixed inset-0 z-70 flex flex-col" style={{ background: worldCharted(cleared) ? "#124e89" : "#3a3025" }}>
             {/* the map is the backdrop, panned and zoomed like a battlefield */}
             <div
               className="absolute inset-0 overflow-hidden"
@@ -12434,7 +12830,11 @@ function addTileEffect(x, y, kind, delay) {
                   backgroundImage: `url(${WORLD_MAP_IMAGE})`,
                   backgroundSize: "100% 100%",
                   imageRendering: "pixelated",
-                  boxShadow: "0 0 0 3px #181425, 0 18px 30px rgba(0,0,0,0.6)",
+                  // Until the world is charted the picture's edge is fog
+                  // against fog, and a border would draw the seam.
+                  ...(worldCharted(cleared)
+                    ? { boxShadow: "0 0 0 3px #181425, 0 18px 30px rgba(0,0,0,0.6)" }
+                    : { outline: "4px solid #3a3025", outlineOffset: -2 }),
                 }}
               >
                 {!worldCharted(cleared) && (
@@ -12455,6 +12855,7 @@ function addTileEffect(x, y, kind, delay) {
                 {TOWNS.filter((t) => revealed(t.id, cleared)).map((t) => (
                 <button
                   key={t.id}
+                  data-place={t.id}
                   className="absolute flex items-center justify-center"
                   onClick={() => {
                     if (!mapCam.moved()) setMapPos(t.id);
@@ -12495,6 +12896,7 @@ function addTileEffect(x, y, kind, delay) {
                   return (
                     <div key={m.name}>
                       <button
+                        data-place={id}
                         disabled={locked || !canTravel}
                         onClick={() => {
                           if (!mapCam.moved()) setMapPos(id);
@@ -12544,7 +12946,7 @@ function addTileEffect(x, y, kind, delay) {
             </div>
 
             {/* where you are */}
-            <div className="relative z-10 pt-3 px-4 text-center pointer-events-none">
+            <div className="relative z-10 pt-3 px-4 text-center pointer-events-none ui-zoom">
               <div className="rpg-title type-fine" style={{ color: "#fee761", textShadow: "2px 2px 0 #181425" }}>
                 {town ? town.name : here.name}
               </div>
@@ -12556,7 +12958,7 @@ function addTileEffect(x, y, kind, delay) {
             <div className="flex-1" />
 
             {/* what you can do here */}
-            <div className="relative z-10 px-3 pb-4 w-full max-w-sm mx-auto">
+            <div className="relative z-10 px-3 pb-4 w-full max-w-sm mx-auto ui-zoom">
               <div className="tactics-panel rounded-lg p-3">
                 {/* Only the one line the map does not already say: that this
                     field has been taken once already. */}
@@ -12567,6 +12969,7 @@ function addTileEffect(x, y, kind, delay) {
                 )}
                 <div className="flex gap-2">
                   <button
+                    data-hotkey="Esc"
                     onClick={() => setScreen(null)}
                     className="bg3a4466 hv5a6988 text-white font-bold text-sm py-3 px-3 rpg-btn"
                   >
@@ -12589,6 +12992,7 @@ function addTileEffect(x, y, kind, delay) {
                   {canTravel ? (
                     town ? (
                       <button
+                        data-hotkey="Enter"
                         onClick={() => {
                           setTownsSeen((prev) => prev.includes(town.id) ? prev : [...prev, town.id]);
                           setScreen(null);
@@ -12600,6 +13004,7 @@ function addTileEffect(x, y, kind, delay) {
                       </button>
                     ) : cleared.includes(mapPos) ? (
                       <button
+                        data-hotkey="Enter"
                         onClick={() => departTo(mapPos, true)}
                         className="flex-1 bga22633 hve43b44 text-white font-bold text-sm py-3 px-3 rpg-btn"
                       >
@@ -12607,6 +13012,7 @@ function addTileEffect(x, y, kind, delay) {
                       </button>
                     ) : (
                       <button
+                        data-hotkey="Enter"
                         onClick={() => departTo(mapPos, false)}
                         className="flex-1 bg63c74d hv8be86a text-slate-900 font-bold text-sm py-3 px-3 rpg-btn"
                       >
@@ -12685,6 +13091,7 @@ function addTileEffect(x, y, kind, delay) {
                       Level {at.level} · {at.purse} gold · {at.draughts} draughts
                     </div>
                     <button
+                      data-hotkey="Enter"
                       onClick={() => { setDemoPick(false); startDemo(demoStage); }}
                       className="w-full bgfeae34 hvfee761 text-slate-900 type-mid font-bold py-2 rpg-btn flex items-center justify-center gap-1.5"
                     >
@@ -12716,7 +13123,7 @@ function addTileEffect(x, y, kind, delay) {
             <div className="flex items-center gap-2 mb-2">
               <SettingsIcon size={15} className="tcfee761" />
               <span className="flex-1 text-sm rpg-title tcfee761">Settings</span>
-              <button onClick={() => setScreen(null)} className="text-slate-500 hover:text-slate-300">
+              <button data-hotkey="Esc" data-quiet onClick={() => setScreen(null)} className="text-slate-500 hover:text-slate-300">
                 <X size={18} />
               </button>
             </div>
@@ -12727,9 +13134,11 @@ function addTileEffect(x, y, kind, delay) {
                 ["terrain", "Terrain", Trees],
                 ["game", "Game", SettingsIcon],
                 ["saves", "Saves", Save],
-              ].map(([id, label, TabIcon]) => (
+              ].map(([id, label, TabIcon], i) => (
                 <button
                   key={id}
+                  data-hotkey={String(i + 1)}
+                  data-cap="corner"
                   onClick={() => setSettingsTab(id)}
                   className={`flex-1 flex flex-col items-center justify-center gap-1 py-2 rpg-btn type-fine font-bold ${
                     settingsTab === id ? "bg-amber-700 text-white" : "bg3a4466 hv5a6988 text-slate-300"
@@ -12748,7 +13157,7 @@ function addTileEffect(x, y, kind, delay) {
                   ["Movement", "You may walk straight through your own allies, but no two fighters can share a tile. Faded blue tiles mark ground you can cross but not stop on."],
                   ["Facing", "Front hits can be blocked or dodged, side half as often, behind never. Flank them."],
                   ["Ground", "High ground adds damage. Thickets give dodge, rubble gives defense, shallow water gives nothing — all cost 2 move. Ground standing four levels over both ends blocks arrows, and deep water cannot be crossed at all."],
-                  ["Forecast", "Tap a target to preview damage, evade chance and counters before you commit."],
+                  ["Forecast", `${tapWord} a target to preview damage, evade chance and counters before you commit.`],
                   ["Skills", "Two per fighter, on cooldowns. Bash shoves, Pin strips defenses, Mend heals free."],
                   ["Loot", "Kills drop gear. Equip it via Party & Inventory during deployment."],
                   ["Growth", "Kills fill a shared pool, split among survivors. Level at the Academy to earn one skill point, then spend it on a stat or a skill-tree node. Fall in battle and you lose all banked experience."],
@@ -12847,6 +13256,25 @@ function addTileEffect(x, y, kind, delay) {
                   <span>Enemy phase speed</span>
                   <span>{phaseSpeed}×</span>
                 </button>
+                {/* Only where the guess could be wrong: a phone is never asked. */}
+                {input.offer && (
+                  <button
+                    onClick={nextControls}
+                    className="w-full flex items-center justify-between py-3 px-3 rpg-btn type-fine font-bold bg-slate-700 text-slate-300"
+                  >
+                    <span>Controls</span>
+                    <span>{CONTROL_MODES.find(([id]) => id === controls)[1]}</span>
+                  </button>
+                )}
+                {input.caps && (
+                  <button
+                    data-hotkey="?"
+                    onClick={() => setShowKeys(true)}
+                    className="w-full flex items-center gap-1.5 justify-center py-3 rpg-btn type-fine font-bold bg3a4466 hv5a6988 text-slate-300"
+                  >
+                    <Keyboard size={13} /> Keyboard keys
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     setScreen("muster");
@@ -12879,11 +13307,42 @@ function addTileEffect(x, y, kind, delay) {
             )}
 
             <button
+              data-hotkey="Esc"
               onClick={() => setScreen(null)}
               className="w-full mt-3 bgfeae34 hvfee761 text-slate-900 text-xs font-semibold py-1.5 rpg-btn"
             >
               Close
             </button>
+        </Modal>
+      )}
+
+      {showKeys && (
+        <Modal z="z-90" width="max-w-sm" inset="px-4" onClose={() => setShowKeys(false)}>
+          <div className="flex items-center gap-2 mb-2">
+            <Keyboard size={15} className="tcfee761" />
+            <span className="flex-1 text-sm rpg-title tcfee761">Controls</span>
+            <button data-hotkey="Esc" data-quiet onClick={() => setShowKeys(false)} className="text-slate-500 hover:text-slate-300">
+              <X size={18} />
+            </button>
+          </div>
+          {CONTROL_KEYS.map(([group, rows]) => (
+            <div key={group} className="mb-2">
+              <div className="text-xs uppercase tracking-wide text-slate-500">{group}</div>
+              {rows.map(([keys, what]) => (
+                <div key={keys} className="flex items-center justify-between type-mid text-slate-300 py-0.5">
+                  <span>{what}</span>
+                  <span className="key-cap">{keys}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <button
+            data-hotkey="Esc"
+            onClick={() => setShowKeys(false)}
+            className="w-full mt-1 bgfeae34 hvfee761 text-slate-900 text-xs font-semibold py-1.5 rpg-btn"
+          >
+            Close
+          </button>
         </Modal>
       )}
 
@@ -12911,18 +13370,20 @@ function addTileEffect(x, y, kind, delay) {
           className="fixed inset-0 flex flex-col items-center"
           style={{
             zIndex: 85, backgroundColor: "#181425", backgroundImage: `url(${SKY_IMAGE})`,
-            backgroundSize: "cover", backgroundPosition: "center top", backgroundRepeat: "no-repeat",
+            backgroundSize: "cover", backgroundPosition: input.desk ? "center bottom" : "center top",
+            backgroundRepeat: "no-repeat",
           }}
         >
-          <h1 className="title-name type-title text-center" style={{ marginTop: "14vh" }}>
+          <h1 className="title-name type-title text-center ui-zoom" style={{ marginTop: "14vh" }}>
             <div>Turney</div>
             <div>Tactics</div>
           </h1>
           {hydrated && (
-            <div className="w-full max-w-xs px-6 flex flex-col" style={{ marginTop: "8vh" }}>
+            <div className="w-full max-w-xs px-6 flex flex-col ui-zoom" style={{ marginTop: "8vh" }}>
               {canContinue ? (
                 <>
                   <button
+                    data-hotkey="Enter"
                     onClick={titleContinue}
                     className="w-full font-bold py-4 rpg-btn type-large bgfeae34 hvfee761 text-slate-900"
                   >
@@ -12937,6 +13398,7 @@ function addTileEffect(x, y, kind, delay) {
                 </>
               ) : (
                 <button
+                  data-hotkey="Enter"
                   onClick={newGame}
                   className="w-full font-bold py-4 rpg-btn type-large bgfeae34 hvfee761 text-slate-900 mb-4"
                 >
@@ -12944,6 +13406,7 @@ function addTileEffect(x, y, kind, delay) {
                 </button>
               )}
               <button
+                data-hotkey="2"
                 onClick={() => setTitleAsk("load")}
                 className="w-full font-bold py-4 rpg-btn type-large bg124e89 hv0099db text-white mb-4"
               >
@@ -12951,6 +13414,7 @@ function addTileEffect(x, y, kind, delay) {
               </button>
               {canContinue && (
                 <button
+                  data-hotkey="3"
                   onClick={() => setTitleAsk("new")}
                   className="w-full font-bold py-4 rpg-btn type-large bg3a4466 hv5a6988 text-white"
                 >
@@ -12976,6 +13440,7 @@ function addTileEffect(x, y, kind, delay) {
             </button>
           </div>
           <button
+            data-hotkey="Esc"
             onClick={() => setTitleAsk(null)}
             className="w-full mt-3 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn"
           >
@@ -12993,12 +13458,13 @@ function addTileEffect(x, y, kind, delay) {
             </p>
             <div className="flex gap-2">
               <button
+                data-hotkey="Esc"
                 onClick={() => setTitleAsk(null)}
                 className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn"
               >
                 Cancel
               </button>
-              <button onClick={newGame} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
+              <button data-hotkey="Enter" onClick={newGame} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
                 New game
               </button>
             </div>
@@ -13012,6 +13478,7 @@ function addTileEffect(x, y, kind, delay) {
             <div className="rpg-title type-fine mb-2">{SAVE_NOTICES[notice].title}</div>
             <p className="type-body text-slate-300 mb-3">{SAVE_NOTICES[notice].body}</p>
             <button
+              data-hotkey="Enter"
               onClick={() => {
                 const was = notice;
                 setNotice(null);
@@ -13080,10 +13547,10 @@ function addTileEffect(x, y, kind, delay) {
           </div>
           <p className="type-body text-slate-300 mb-3">Your current saves will be replaced.</p>
           <div className="flex gap-2">
-            <button onClick={() => setBackupIn(null)} className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn">
+            <button data-hotkey="Esc" onClick={() => setBackupIn(null)} className="flex-1 bg3a4466 hv5a6988 text-white text-base font-bold py-3 rpg-btn">
               Cancel
             </button>
-            <button onClick={applyBackup} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
+            <button data-hotkey="Enter" onClick={applyBackup} className="flex-1 bga22633 hve43b44 text-white text-base font-bold py-3 rpg-btn">
               Import
             </button>
           </div>
@@ -13177,6 +13644,7 @@ function addTileEffect(x, y, kind, delay) {
                       </div>
                     </div>
                     <button
+                      data-hotkey="Enter"
                       onClick={() => loadSave(fallBack)}
                       className="w-full bgfeae34 hvfee761 text-slate-900 font-bold text-base py-3 px-5 rpg-btn"
                     >
@@ -13195,6 +13663,7 @@ function addTileEffect(x, y, kind, delay) {
               </div>
             ) : gameOver === "skirmish" ? (
               <button
+                data-hotkey="Enter"
                 onClick={() => {
                   setGameOver(null);
                   setScreen("map");
@@ -13211,6 +13680,7 @@ function addTileEffect(x, y, kind, delay) {
                  decides which banner is shown. */
               <div className="flex gap-2">
                 <button
+                  data-hotkey="Enter"
                   onClick={() => {
                     setMapPos(nextUnbeaten([...cleared, mapId]));
                     setScreen("map");
